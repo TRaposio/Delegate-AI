@@ -1,0 +1,66 @@
+# Golden set for evaluating the WCA RAG system.
+#
+# Each entry is a real or realistic incident scenario with the regulations
+# that a correct answer should cite. The user (a delegate) writes these
+# from competition experience.
+#
+# Fields:
+#   id:              unique integer
+#   question:        the incident scenario, written as a delegate would phrase it
+#   expected_rules:  list of regulation IDs the answer must reference to be correct.
+#                    Use the canonical ID format from the regulations (e.g. "11e",
+#                    "11e++", "A3c1"). Order doesn't matter.
+#   article:         primary article(s) the incident lives under (for filtering analysis)
+#   difficulty:      easy | medium | hard
+#                    - easy: single rule applies directly
+#                    - medium: multiple rules, requires combining
+#                    - hard: edge case, ambiguous, or requires cross-references
+#   notes:           optional. Why this case is interesting, or what makes it tricky.
+#
+# Aim for ~20 entries spanning easy/medium/hard and multiple articles.
+# Include cases the system will likely fail on — those are the most valuable.
+
+- id: 1
+  question: >
+    A competitor finishes their solve and signs the scorecard. Five minutes
+    later they tell me a judge bumped them mid-solve and they want an extra.
+    Can I grant it?
+  expected_rules: ["11e", "11e++++", "11e+++"]
+  article: "11"
+  difficulty: easy
+  notes: >
+    11e++++ explicitly states the attempt is finished after signing the score
+    sheet. 11e+++ says stronger discretion should apply post-finish. 11e is
+    the parent rule on extra attempts and timing of appeals.
+
+- id: 2
+  question: >
+    During a 3x3 final, the venue fire alarm goes off in the middle of a
+    competitor's solve. What do I do?
+  expected_rules: ["11a2", "11b", "11e"]
+  article: "11"
+  difficulty: easy
+  notes: >
+    11a2 explicitly lists facility interruptions including alarms.
+
+- id: 3
+  question: >
+    A scrambler tells me after the group that they realized they used the
+    same scramble twice for one competitor. The competitor has already
+    finished. What's the call?
+  expected_rules: ["11j", "11j3"]
+  article: "11"
+  difficulty: easy
+  notes: >
+    Duplicate scramble noticed during competition but after the group → 11j3
+    requires extra attempt.
+
+# TEMPLATE — duplicate this block for new entries:
+# - id: N
+#   question: >
+#     ...
+#   expected_rules: ["..."]
+#   article: "..."
+#   difficulty: easy | medium | hard
+#   notes: >
+#     ...
