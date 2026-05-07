@@ -8,7 +8,7 @@ during competitions; answers must cite the specific regulations applied.
 
 Constraints:
 - Free / no paid APIs.
-- Local execution on a 2015 MacBook Pro (CPU-only, ~16GB RAM).
+- Local execution on a 2015 MacBook Pro (CPU-only, 8GB RAM).
 - English only for v1.
 - Goal balance: learn RAG end-to-end **and** produce a usable tool.
 
