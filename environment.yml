@@ -1,0 +1,15 @@
+name: wca-rag
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - pyyaml
+  - pytorch
+  - sentence-transformers
+  - ipython
+  - tqdm
+  - pip
+  - pip:
+      - google-generativeai

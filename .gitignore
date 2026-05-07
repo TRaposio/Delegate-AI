@@ -1,1 +1,19 @@
+# environments
+.conda/
+.venv/
+
+# data artifacts (per CLAUDE.md and ARCHITECTURE.md)
+data/chunks.jsonl
+data/embeddings/
+data/chroma/
+evals/results/
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# editor / OS
 .DS_Store
+.vscode/
+.idea/
