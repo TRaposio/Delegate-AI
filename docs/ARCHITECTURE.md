@@ -48,7 +48,7 @@ References for further reading:
 
 ## 3. Component choices
 
-### 3.1 Embedding model 🟡
+### 3.1 Embedding model 🟢
 
 **Proposed:** `BAAI/bge-small-en-v1.5` via `sentence-transformers` (local).
 
@@ -65,6 +65,31 @@ References for further reading:
 spot at the local-and-free price point. The marginal MTEB gap to `bge-large`
 will not matter at this corpus size. Behind an `Embedder` interface for easy
 swap.
+
+**Implemented.** `wca_rag/embedder.py` defines the `Embedder` ABC with
+`encode_documents` / `encode_query` (separate methods, not a flag, to
+make the bge query-document asymmetry a contract). Default
+implementation: `SentenceTransformerEmbedder` wrapping
+`BAAI/bge-small-en-v1.5`. Vectors are L2-normalized at encode time so
+the retriever can use dot product directly.
+
+**Index outputs** (`wca_rag/index.py`, run via `python -m wca_rag.index`):
+- `data/embeddings.npy` — `(108, 384)` float32, L2-normalized.
+- `data/chunk_ids.json` — list of regulation_ids, parallel to
+  embedding rows. Acts as the join key from the matrix back to
+  `chunks.jsonl`.
+- `data/embeddings.meta.json` — sidecar recording model name, embedding
+  dim, normalization flag, chunk count, corpus fingerprint
+  (sha1 of sorted `text_hash` values), and creation timestamp. Used to
+  detect stale embeddings after re-parsing.
+
+**Validation.** `scripts/inspect_embeddings.py` runs on the persisted
+artifacts: checks shape/dtype/normalization, verifies `chunk_ids` are
+row-aligned with `chunks.jsonl`, confirms the corpus fingerprint matches
+the current parser output, asserts every chunk is its own nearest
+neighbor (sanity check on normalization + the matrix multiply), and
+prints similarity-distribution percentiles plus sample top-k neighbors
+for eyeball validation.
 
 ### 3.2 Vector store 🟡
 
@@ -217,6 +242,60 @@ via golden set, then decide.
 
 ---
 
+### 3.8 Retriever 🟢
+
+**Implemented.** `wca_rag/retriever.py` exposes a `Retriever` class with
+a `from_disk()` classmethod and a `retrieve(query, k=5)` method. CLI
+entry point: `wca_rag/query.py`, run via
+`python -m wca_rag.query "your question"`.
+
+**Algorithm.** Brute-force cosine similarity over the full matrix:
+
+```python
+query_vec = embedder.encode_query(query)         # (384,)
+scores = embeddings @ query_vec                  # (108,) cosine sim
+top_k_idx = np.argsort(scores)[-k:][::-1]
+```
+
+Three lines, no index structure. At 108 chunks this is several orders
+of magnitude below where an ANN index would help; brute force is both
+the fastest and the simplest option. See `CONCEPTS.md → Brute-force
+retrieval` for the scaling argument.
+
+**Why NumPy and not ChromaDB.** ChromaDB will replace this when (a) we
+need metadata filtering (e.g. "only Article 11 chunks") or (b) the
+corpus grows past ~10k chunks. Until then, NumPy is dependency-free
+and the math is exposed for learning. The `Retriever` API is small
+enough that swapping its internals later won't ripple into callers.
+
+**Defensive checks at construction.** The `Retriever` constructor
+validates that:
+- embeddings row count == len(chunk_ids),
+- every chunk_id is present in chunks.jsonl,
+- embeddings dim == embedder.embedding_dim (catches a model swap with a
+  stale index).
+
+These fail loud at construction rather than silently producing wrong
+retrievals at query time.
+
+**Output: `RetrievalHit` dataclass.** Each hit carries `rank`, `score`
+(cosine in [-1, 1]), `regulation_id`, and the full `chunk` dict. The
+generator stage will read `chunk["text"]` for the LLM prompt and
+`regulation_id` for the citation marker — note: `text`, not
+`text_for_embedding` (the prepended header is for the embedder only,
+not for human display or LLM context). See §3.5.
+
+**Deferred to retriever v2:**
+- Metadata filtering (will arrive with ChromaDB).
+- Score thresholding (drop hits below similarity X). Currently every
+  retrieval returns exactly k hits; some may be irrelevant when the
+  query is out-of-domain. Worth measuring on the golden set before
+  adding complexity.
+- Cross-reference expansion (see §3.7).
+- Reranking (see §7.1, hybrid retrieval upgrade).
+
+---
+
 ## 4. End-to-end pipeline
 
 ### Indexing (offline)
@@ -225,13 +304,15 @@ via golden set, then decide.
 data/raw/wca-regulations.md
         │
         ▼
-[parser]  ──► structured chunks + metadata (data/chunks.jsonl)
+[parser]   ──► chunks + metadata (data/chunks.jsonl)         ✅
         │
         ▼
-[embedder] ──► vectors (data/embeddings/)
+[embedder] ──► (data/embeddings.npy,                         ✅
+                data/chunk_ids.json,
+                data/embeddings.meta.json)
         │
         ▼
-[chroma]   ──► persisted vector DB (data/chroma/)
+[chroma]   ──► persisted vector DB (data/chroma/)            ⬜ later
 ```
 
 ### Query (online)
@@ -240,16 +321,16 @@ data/raw/wca-regulations.md
 user question
         │
         ▼
-[embedder] ──► query vector
+[embedder.encode_query]  ──► query vector                    ✅
         │
         ▼
-[chroma top-k] ──► k chunks + metadata (k tbd, start at 5)
+[retriever]              ──► top-k hits + metadata           ✅ (NumPy; Chroma later)
         │
         ▼
-[prompt assembler] ──► system prompt + chunks + question
+[prompt assembler]       ──► system prompt + chunks + question  ⬜ next
         │
         ▼
-[generator] ──► answer with regulation IDs cited
+[generator]              ──► answer with regulation IDs cited   ⬜ next
 ```
 
 ---

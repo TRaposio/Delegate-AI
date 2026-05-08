@@ -24,6 +24,11 @@ Each entry follows the same shape:
 - [Inspectable intermediate artifacts](#inspectable-intermediate-artifacts)
 - [Golden set evaluation](#golden-set-evaluation)
 - [Recall@k](#recallk)
+- [Embeddings](#embeddings)
+- [Cosine similarity, dot product, L2 normalization](#cosine-similarity-dot-product-l2-normalization)
+- [Bi-encoder vs cross-encoder](#bi-encoder-vs-cross-encoder)
+- [Query-document asymmetry](#query-document-asymmetry)
+- [Brute-force retrieval (and when to stop)](#brute-force-retrieval-and-when-to-stop)
 
 ---
 
@@ -353,3 +358,385 @@ classification, just applied to a ranked list.
 
 **Further reading.**
 - Manning, Raghavan, Schütze, *Introduction to Information Retrieval*, ch. 8 — canonical IR metrics reference.
+
+---
+ 
+## Embeddings
+ 
+**What it is.** A function that maps a piece of text to a fixed-length
+vector of floats — for `bge-small`, 384 numbers between roughly -1 and 1.
+The vector is the model's compressed representation of the text's
+*meaning*. Two texts with similar meaning produce vectors that are close
+to each other in 384-dimensional space; texts with unrelated meaning
+produce vectors that are far apart.
+ 
+That's the whole pitch. "Closeness in vector space" is the proxy for
+"similarity in meaning," and it's good enough that you can do dense
+retrieval (find the closest documents to a query) by comparing vectors.
+ 
+**Why it matters.**
+- **Semantic search beats keyword search for natural-language queries.** A
+  user asking "what happens when a competitor's puzzle pops?" never says
+  "DNF" or "Article 11," but the embedding of their question lands near
+  the embedding of the relevant regulation regardless. Keyword search
+  would miss this; embeddings won't.
+- **Embeddings are precomputed.** You embed your 108 chunks once, persist
+  the matrix, and at query time you only embed the 1 question. The
+  expensive work happens offline.
+- **They generalize across phrasings.** "Puzzle came apart," "cube broke,"
+  "pieces fell off" all land in roughly the same neighborhood. You don't
+  have to enumerate synonyms.
+**How it actually works (one paragraph).** A transformer reads the input
+text, processes it through 12 attention layers, and produces a token-level
+representation for each token. A pooling layer collapses those into a
+single vector — `bge-small` mean-pools the token vectors and then projects
+to 384 dims. The model was trained on millions of (similar text, similar
+text) and (similar text, dissimilar text) pairs with a contrastive loss:
+push similar pairs together in vector space, push dissimilar pairs apart.
+After training, the geometry of the space *is* the meaning.
+ 
+**Tradeoffs.**
+- **It's a black box.** You can't read off "what dimension 47 means" — the
+  space is learned, not designed. Debugging is by comparison
+  (`scripts/inspect_embeddings.py`), not introspection.
+- **Quality is bounded by training data.** A model trained on web English
+  will be bad at code, bad at non-English, bad at niche jargon. Domain
+  shift is real. (Cubing terminology happens to be common enough on the
+  open web that bge handles it acceptably.)
+- **Fixed dimensionality is a compression.** 384 floats can't perfectly
+  represent every nuance of every paragraph. Information is lost. The
+  loss is small enough to be useful, large enough that retrieval will
+  occasionally surface a wrong neighbor.
+- **Embeddings are model-specific.** Vectors from bge-small and vectors
+  from OpenAI `text-embedding-3-small` are not interchangeable, even
+  though both are 384-dim. They live in different spaces. Swap the model
+  → re-embed everything.
+**Connection to your day job.** Embeddings are dimensional reduction with
+a learned objective. PCA reduces to N dims by preserving variance;
+embeddings reduce to N dims by preserving "semantic similarity" (a thing
+defined by the training data). If you've ever computed `cosine_similarity`
+between TF-IDF vectors of documents, embeddings are the same idea — but
+with a learned representation that captures meaning instead of raw word
+co-occurrence.
+ 
+**Further reading.**
+- Jay Alammar, "The Illustrated Transformer" — visual intro to what
+  transformers do under the hood.
+- The `bge` paper (Xiao et al. 2023, *C-Pack*) — describes how the model
+  we use was trained.
+- HuggingFace MTEB leaderboard (`huggingface.co/spaces/mteb/leaderboard`)
+  — practical comparison of embedding models. Useful when picking one.
+---
+ 
+## Cosine similarity, dot product, L2 normalization
+ 
+**What it is.** Three closely-related concepts you can't avoid in dense
+retrieval. Best understood together because the relationship between them
+is what makes RAG fast.
+ 
+**Cosine similarity** measures the angle between two vectors:
+ 
+```
+cos(a, b) = (a · b) / (|a| × |b|)
+```
+ 
+Range: -1 (opposite direction) to 0 (perpendicular) to 1 (same direction).
+Magnitude doesn't matter, only direction. Two vectors pointing the same
+way score 1 regardless of length.
+ 
+**Dot product** is the numerator alone:
+ 
+```
+a · b = Σ a_i × b_i
+```
+ 
+Range: unbounded. Captures both direction and magnitude.
+ 
+**L2 normalization** scales a vector to unit length:
+ 
+```
+a_normalized = a / |a|
+```
+ 
+After normalization, `|a| = 1`. Information about magnitude is discarded;
+only direction remains.
+ 
+**The trick.** If both `a` and `b` are L2-normalized, then `|a| × |b| = 1`,
+so:
+ 
+```
+cos(a, b) = a · b
+```
+ 
+Cosine similarity reduces to dot product. No division needed.
+ 
+**Why this matters for RAG.** With normalized embeddings, retrieval is
+literally one matrix multiply: `embeddings @ query_vec` produces all 108
+similarity scores in one CPU instruction sweep. No square roots, no
+divisions, no per-pair cosine computations. The retriever code is three
+lines:
+ 
+```python
+scores = embeddings @ query_vec      # (108,) cosine similarities
+top_k_idx = np.argsort(scores)[-k:][::-1]
+hits = [chunk_ids[i] for i in top_k_idx]
+```
+ 
+That third line is the entire retrieval algorithm at this corpus size.
+ 
+**Why cosine and not Euclidean distance?** For text embeddings, direction
+encodes meaning and magnitude is mostly noise (longer documents tend to
+have larger embedding norms even when topically identical to short ones).
+Cosine factors out magnitude; Euclidean conflates the two. The standard
+result: cosine outperforms Euclidean on text retrieval benchmarks.
+Normalize once, use dot product forever.
+ 
+**Tradeoffs.**
+- **You commit to "direction is meaning."** True for text. Less true for
+  some other modalities — image embeddings sometimes use Euclidean.
+- **Normalization is destructive.** If magnitude does carry information,
+  you lose it. For text it doesn't, so this is fine.
+- **The normalization invariant is silent if violated.** If you forget
+  `normalize_embeddings=True` in one place, dot product still runs and
+  still produces numbers — they're just not cosine similarities anymore,
+  and your retrieval quality silently degrades. This is why
+  `inspect_embeddings.py` asserts `np.linalg.norm(embeddings, axis=1) ≈ 1`.
+**Connection to your day job.** This is the same family as Pearson
+correlation, which is also "cosine similarity after centering." If you've
+computed correlation between two columns in pandas, you've done this
+math.
+ 
+**Further reading.**
+- Manning, Raghavan, Schütze, *Introduction to Information Retrieval*,
+  ch. 6 — derives cosine similarity from first principles in the
+  vector-space-model context.
+- Pinecone, "Cosine Similarity" — short visual explainer.
+---
+ 
+## Bi-encoder vs cross-encoder
+ 
+**What it is.** Two architectures for scoring "how relevant is document D
+to query Q." They make opposite tradeoffs between accuracy and speed.
+ 
+**Bi-encoder.** Encode `Q` and `D` independently into vectors. Score with
+a similarity function (dot product or cosine). The two encodings never
+interact during the model forward pass.
+ 
+```
+Q → encoder → q_vec ───┐
+                       ├── score = q_vec · d_vec
+D → encoder → d_vec ───┘
+```
+ 
+**Cross-encoder.** Concatenate `Q` and `D` into a single input, feed
+through the model, output a scalar relevance score. The model attends
+across both texts simultaneously.
+ 
+```
+[Q, D] → encoder → score
+```
+ 
+**Why it matters.** The choice of architecture determines what you can
+precompute, which determines how fast your retrieval is.
+ 
+| | Bi-encoder | Cross-encoder |
+|---|---|---|
+| Document encoding | Precomputed once | Recomputed every query |
+| Query-time work for n docs | 1 query encode + n dot products | n full model forward passes |
+| Accuracy | Lower (no Q×D interaction) | Higher (model sees both) |
+| Use case | First-stage retrieval | Reranking a small candidate set |
+ 
+**Concrete numbers.** For 108 chunks at query time:
+- Bi-encoder: 1 model call + a 108×384 matrix multiply ≈ ~10ms.
+- Cross-encoder: 108 model calls ≈ ~1.5 seconds, even on a small model.
+For 100k chunks the bi-encoder is still ~10ms; the cross-encoder is
+20+ minutes. Cross-encoders are not retrievers, they're rerankers.
+ 
+**The standard production pattern.**
+1. Bi-encoder retrieves top-50 from the full corpus (fast, approximate).
+2. Cross-encoder reranks those 50 into a tighter top-5 (slow, accurate).
+You get bi-encoder speed and cross-encoder quality, paying the
+cross-encoder cost only on a small candidate set. This is on
+`ARCHITECTURE.md §7` as the v2 hybrid retrieval upgrade.
+ 
+**For WCA specifically.** v1 is bi-encoder only — `bge-small-en-v1.5`
+embedding + dot product. Cross-encoder reranking comes after the golden
+set is built and we can measure whether it actually moves the needle.
+ 
+**Tradeoffs.**
+- **Bi-encoder loses query-document interaction information.** A
+  cross-encoder can notice "the query mentions X but the document
+  contradicts X" — bi-encoders can't, because Q and D never see each
+  other. This is the accuracy gap.
+- **Cross-encoders can't be precomputed.** Every (Q, D) pair is a fresh
+  forward pass. Fundamentally not a retrieval architecture for n > a few
+  hundred.
+- **Bi-encoder accuracy is not bad — just lower.** On standard benchmarks
+  bi-encoders typically reach 80–90% of cross-encoder accuracy at 1/100
+  the latency. The gap matters more for marginal cases than typical ones.
+**Connection to your day job.** Bi-encoder is a hash-based join — both
+sides hash independently, you join on equality of hashes. Cross-encoder
+is a nested-loop join — for every pair, compute the relationship from
+scratch. Same speed/accuracy tradeoff, same query-planner instinct: use
+the cheap operation to filter, use the expensive one to refine.
+ 
+**Further reading.**
+- Reimers & Gurevych 2019, *Sentence-BERT* — introduced bi-encoders for
+  sentence-level retrieval. The reason `sentence-transformers` exists.
+- Nogueira & Cho 2019, *Passage Re-ranking with BERT* — cross-encoder
+  reranking, the canonical reference.
+---
+ 
+## Query-document asymmetry
+ 
+**What it is.** With many embedding models, queries and documents need
+*different treatment* before being fed to the same encoder, even though
+the encoder itself is one model. The asymmetry is in what wraps the input.
+ 
+For `bge-small-en-v1.5`:
+- Documents: embedded as-is.
+- Queries: prefixed with `"Represent this sentence for searching relevant passages: "`.
+Other models do it differently:
+ 
+| Model | Query side | Document side |
+|---|---|---|
+| `bge` family | prefix string | no prefix |
+| E5 family | `"query: "` prefix | `"passage: "` prefix |
+| OpenAI `text-embedding-3` | symmetric (no prefix) | symmetric |
+| Voyage / Cohere | `input_type="query"` API param | `input_type="document"` API param |
+ 
+**Why it matters.** The model was *trained* on this asymmetry. During
+contrastive training, the query side and document side were presented in
+their respective formats. The model learned that text starting with the
+query prefix is a *question looking for an answer*, and text without it
+is *content that might be the answer*. The prefix shifts the query's
+embedding toward the region of vector space where matching documents
+live.
+ 
+Skip the prefix and the query lands in a slightly wrong neighborhood.
+Retrieval still works — the embeddings aren't completely decoupled — but
+quality drops measurably. The bge model card reports a few-point hit on
+benchmarks when the prefix is omitted.
+ 
+**For WCA specifically.** `wca_rag/embedder.py` has two separate methods:
+ 
+```python
+def encode_documents(self, texts: list[str]) -> np.ndarray:
+    # No prefix.
+    return self._model.encode(texts, ...)
+ 
+def encode_query(self, text: str) -> np.ndarray:
+    prefixed = f"{self._query_prefix}{text}"
+    return self._model.encode([prefixed], ...)[0]
+```
+ 
+Two methods (not one method with a flag) so the asymmetry is enforced by
+the type system, not by caller discipline. The indexer can only call
+`encode_documents`; the retriever can only call `encode_query`. Misuse
+requires actively defeating the API.
+ 
+**Tradeoffs.**
+- **You add prefix-handling complexity to your code.** Worth it; the
+  prefix tokens are a small embedding cost vs. the retrieval-quality
+  benefit.
+- **It's model-specific and easy to forget on swap.** Move from bge to
+  E5 → prefix changes from `"Represent this sentence..."` to `"query: "`.
+  Move to OpenAI → no prefix at all. Worth keeping the prefix in a named
+  constant so the dependency is obvious in code review.
+- **The asymmetry is invisible in the embedding output.** A query
+  embedded *without* the prefix produces a vector that looks normal —
+  same shape, same dtype, similar magnitude. The bug only shows as
+  worse retrieval. This is one of those places where automated tests
+  can't help; only golden-set evaluation will catch it.
+**Connection to your day job.** This is the same shape as parameterized
+queries vs. raw strings in SQL. The database treats `?`-bound parameters
+differently from inline literals — same statement, different processing
+paths. You learn the convention of your driver and stick to it.
+ 
+**Further reading.**
+- The bge-small model card on HuggingFace (`huggingface.co/BAAI/bge-small-en-v1.5`)
+  — documents the prefix and the rationale.
+- The E5 paper (Wang et al. 2022, *Text Embeddings by Weakly-Supervised
+  Contrastive Pre-training*) — introduces the `query: ` / `passage: `
+  convention for that model family.
+---
+ 
+## Brute-force retrieval (and when to stop)
+ 
+**What it is.** Compute the similarity between the query vector and
+*every* document vector, then sort. No index, no approximation, no tree
+structure. For 108 chunks, this is `embeddings @ query_vec` followed by
+`argsort` — three lines of NumPy.
+ 
+**Why it matters.** Brute force is the fastest possible approach at small
+scale, and it's the simplest possible approach at any scale. Vector
+databases like ChromaDB exist to do something *cleverer* than brute force
+when you have millions of vectors and brute force gets slow. Until you
+hit that point, the database is overhead, not optimization.
+ 
+**The numbers.**
+ 
+| Corpus size | Brute-force latency (CPU) | Need an index? |
+|---|---|---|
+| 100 | ~0.05 ms | Absolutely not |
+| 10,000 | ~5 ms | No |
+| 100,000 | ~50 ms | Probably not |
+| 1,000,000 | ~500 ms | Yes, switch to HNSW |
+| 10,000,000+ | seconds | Yes, definitely |
+ 
+A single `embeddings @ query_vec` is a BLAS-optimized matrix-vector
+multiply. Modern CPUs can do this on a 100k×384 matrix in milliseconds.
+The crossover where brute force becomes painful is around 1M vectors —
+many orders of magnitude above where most projects actually live.
+ 
+**For WCA specifically.** 108 chunks. Brute force is so far below the
+crossover that anything else would be performance theater. The retriever
+in `wca_rag/retriever.py` is intentionally just NumPy. ChromaDB enters
+the picture later for two reasons that have nothing to do with speed:
+ 
+1. **Metadata filtering.** "Retrieve only chunks where `article == '11'`"
+   is a one-liner in Chroma; in NumPy it's an extra mask layer.
+2. **API ergonomics.** Chroma's `add` / `query` API is a stable contract
+   that survives swapping vector backends. NumPy is a contract you
+   maintain yourself.
+**The clever-index approaches (for context).**
+- **HNSW (Hierarchical Navigable Small World)** — a graph structure
+  where nearest-neighbor search becomes graph traversal. Approximate but
+  very fast, sub-linear in corpus size. What ChromaDB / FAISS / Qdrant /
+  Pinecone use under the hood.
+- **IVF (Inverted File Index)** — cluster the corpus, search only the
+  nearest clusters at query time. Used by FAISS for very large indexes.
+- **Product Quantization** — compress vectors to 8-bit codes, do
+  approximate similarity in the compressed space. Memory savings at the
+  cost of accuracy. Used in conjunction with the above for billion-scale
+  indexes.
+All of these are *approximate* nearest neighbor (ANN) methods. They
+trade a tiny amount of accuracy (typically <1% recall loss) for huge
+speedups. At our scale we don't need any of them, and we don't pay the
+accuracy cost.
+ 
+**Tradeoffs.**
+- **Brute force scales linearly in n.** Doubling the corpus doubles the
+  retrieval time. ANN indexes scale sub-linearly (typically log n or
+  better). The crossover is corpus-size-dependent and hardware-dependent
+  — measure before optimizing.
+- **Brute force is exact.** No approximation, no recall loss, no
+  parameters to tune. The simplicity is a feature when you're debugging
+  retrieval quality, because you've eliminated one source of error.
+- **Brute force keeps the full matrix in memory.** 100k chunks × 384
+  dims × 4 bytes = 150 MB. Fine. 10M chunks × 1024 dims × 4 bytes = 40
+  GB. Not fine. Memory is the practical scaling limit, not CPU.
+**Connection to your day job.** This is the SQL equivalent of `SELECT *
+FROM chunks ORDER BY similarity(embedding, ?) DESC LIMIT 5` with no
+index on the similarity column. The DB does a full table scan. For 108
+rows that's a non-issue and probably faster than maintaining an index.
+For 100M rows you build the index. The reasoning is the same: indexes
+are an optimization, not a default.
+ 
+**Further reading.**
+- Erik Bernhardsson's ANN benchmarks (`ann-benchmarks.com`) — empirical
+  comparison of ANN libraries on standard datasets. Useful if/when we
+  need to pick one.
+- Malkov & Yashunin 2016, *Efficient and robust approximate nearest
+  neighbor search using HNSW graphs* — the HNSW paper. Worth reading
+  once when ChromaDB stops feeling magical.
