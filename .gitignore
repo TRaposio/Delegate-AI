@@ -6,6 +6,7 @@
 data/chunks.jsonl
 data/embeddings/
 data/chroma/
+data/embeddings_meta/
 evals/results/
 
 # python
