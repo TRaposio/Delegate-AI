@@ -4,7 +4,7 @@
 
 # data artifacts (per CLAUDE.md and ARCHITECTURE.md)
 data/chunks.jsonl
-data/embeddings/
+data/embeddings_meta/
 data/chroma/
 data/embeddings_meta.json
 date/embeddings.npy
