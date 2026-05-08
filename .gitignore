@@ -6,7 +6,8 @@
 data/chunks.jsonl
 data/embeddings/
 data/chroma/
-data/embeddings_meta/
+data/embeddings_meta.json
+date/embeddings.npy
 evals/results/
 
 # python
@@ -19,5 +20,9 @@ __pycache__/
 .vscode/
 .idea/
 
+# env variables
+.env
+
 # misc
 todo.txt
+SESSION_HANDOFF.md
