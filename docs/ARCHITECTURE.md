@@ -125,6 +125,11 @@ them together preserves meaning and makes citations natural.
   context (a child rule is meaningless without the parent).
 - *One chunk per article.* Too large; a single article like Article 11 is
   ~5k words — would dominate retrieval and dilute precision.
+- *Embedding-based semantic chunking* (split on similarity drops between
+  consecutive sentences). Loses regulation IDs as chunk anchors, which our
+  citation strategy depends on. May revisit narrowly as a sub-splitter for
+  oversized chunks (`9f`, `A1`, `A7`, `E2`) if eval shows they hurt
+  retrieval. See `CONCEPTS.md` for details.
 
 **Outcome (post-implementation):**
 - **108 chunks** across all 16 articles (initial estimate was ~150).
@@ -134,32 +139,53 @@ them together preserves meaning and makes citations natural.
 
 ### 3.5 Metadata schema 🟢
 
-**Implemented per-chunk metadata:**
+**Implemented per-chunk fields** (matches `wca_rag/parser.py`):
 
 ```python
 {
-    "regulation_id": "11e",              # primary citation key
+    "regulation_id": "11e",                 # primary citation key
     "article": "11",
     "article_title": "Incidents",
-    "is_annotation": False,              # True for +/++/+++ rules
+    "full_path_id": "11 > 11e",             # human-readable path for display/debugging
+    "label": "CLARIFICATION" | None,        # top-level regulation's label, if any
+    "is_annotation": False,                 # True for +/++/+++ rules
     "depth": 1,
     "parent_id": None,
-    "cross_references": ["11i2", "9l"],  # extracted from regulation text
+    "cross_references": [                   # extracted from regulation text
+        {"type": "regulation", "id": "11i2"},
+        {"type": "article", "id": "I"},
+    ],
     "char_count": 412,
-    "source_version": "2026-04-01",
+    "text_hash": "a3f1...",                 # sha1 of body, for change detection
+    "source_version": "April 1, 2026",
+    "text": "...",                          # raw chunk body
+    "text_for_embedding": "...",            # body + prepended article/regulation header
 }
 ```
 
 Used for:
 - **Citation** in answers (`regulation_id`).
 - **Filtering** (`where article == "11"` for incident-only queries).
-- **Debugging** retrieval (human-readable chunk inspection).
-- **Future link-aware retrieval** via `cross_references`.
+- **Debugging** retrieval (human-readable chunk inspection via `full_path_id`).
+- **Future link-aware retrieval** via `cross_references`. The
+  `type` distinguishes regulation references (one chunk) from article
+  references (many chunks); these expand differently.
+- **Change detection on re-parse** via `text_hash` — diff two `chunks.jsonl`
+  files across corpus versions.
 
-**Diff from initial proposal:** the `label` field (`CLARIFICATION`, `EXAMPLE`, etc.)
-was dropped from chunk-level metadata since labels apply to individual annotations
-within a chunk, not to the chunk as a whole. The label text is preserved in the
-chunk content itself.
+**`text` vs `text_for_embedding` — important distinction.** The parser emits
+two versions of the chunk body:
+
+- `text` is the raw body of the regulation (just the rule text and its
+  annotations/children).
+- `text_for_embedding` prepends a stable header: `Article {N}: {title}\nRegulation {id}\n\n{text}`.
+
+The embedder reads `text_for_embedding`, not `text`. The prompt assembler
+that builds the LLM context reads `text` plus uses `regulation_id` for the
+citation marker. This split exists because a chunk like `e2)` is meaningless
+to an embedding model in isolation — the prepended header gives the
+embedding model the article context it needs to place the chunk in semantic
+space. This is the metadata-prepend pattern flagged in `OPEN_QUESTIONS.md §5`.
 
 ### 3.6 Interface 🟢
 
@@ -185,6 +211,9 @@ via golden set, then decide.
   (incorrect scrambles).
 - These hubs are good candidates for "always retrieve alongside" link-aware
   retrieval, when we get to v2.
+- Note that `cross_references` distinguishes `regulation` and `article`
+  types; article expansion (e.g. "include all of Article 11") behaves very
+  differently from regulation expansion (one chunk).
 
 ---
 

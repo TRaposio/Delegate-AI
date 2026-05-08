@@ -17,7 +17,9 @@ Each entry follows the same shape:
 - [RAG (Retrieval-Augmented Generation)](#rag-retrieval-augmented-generation)
 - [Why retrieve at all? (RAG vs long-context stuffing)](#why-retrieve-at-all-rag-vs-long-context-stuffing)
 - [Chunking](#chunking)
+- [Semantic Chunking](#semantic-chunking)
 - [Chunk metadata](#chunk-metadata)
+- [Metadata-prepend (what you embed ≠ what you display)](#metadata-prepend-what-you-embed--what-you-display)
 - [Cross-references and graph-augmented retrieval](#cross-references-and-graph-augmented-retrieval)
 - [Inspectable intermediate artifacts](#inspectable-intermediate-artifacts)
 - [Golden set evaluation](#golden-set-evaluation)
@@ -111,6 +113,52 @@ and children. See `ARCHITECTURE.md §3.4` for the decision and
 
 ---
 
+## Semantic chunking
+
+**What it is.** A family of chunking strategies that split text by *meaning*
+rather than by character or token count. The shared idea: chunk boundaries
+should fall where one coherent unit ends and another begins, not where a
+counter happens to hit 500. The three common approaches differ in how they
+detect those boundaries.
+
+**The three flavors.**
+
+| Approach | How it finds boundaries | When to use it |
+|---|---|---|
+| **Structure-aware** | Uses explicit cues already in the document — headings, IDs, sections, list items, code fences. Boundaries are deterministic and free. | The document has reliable structure: legal/regulatory text, technical specs, structured markdown, API docs. ✅ what we use for WCA. |
+| **Embedding-based** | Embeds adjacent sentences (or windows), measures similarity drift, splits where similarity drops below a threshold. | Prose with no structural markers but real topic shifts: long-form articles, transcripts, books. |
+| **LLM-based** | Asks an LLM to segment the document directly ("split this into self-contained chunks"). | Complex prose where neither structure nor sentence similarity is reliable, and you can afford the inference cost. |
+
+**Why it matters.**
+- **Retrieval quality is bottlenecked by chunk coherence.** A chunk that mixes two unrelated topics gets an "average-y" embedding that matches neither well. A chunk cut mid-thought leaves the answer unreachable.
+- **It's the cheapest, highest-leverage tuning lever.** Better chunking usually beats a better embedding model at this corpus size. You don't need to retrain or pay more — you just need to cut in the right places.
+- **Most "RAG isn't working" stories trace back to chunking.** Before reaching for rerankers, hybrid search, or fine-tuning, fix the chunks.
+
+**Tradeoffs.**
+- **Structure-aware is free but brittle.** Requires the document to actually have reliable structure. Garbage markdown → garbage chunks. Pays off massively when the structure is clean (WCA's `11e`/`11e+`/`11e1` IDs are gold).
+- **Embedding-based is general but tunable.** You pick the similarity threshold, which is dataset-dependent. Too tight → too many tiny chunks; too loose → falls back to character-count behavior. Usually requires eyeballing a sample to pick a threshold.
+- **LLM-based is highest quality but slowest and most expensive.** One LLM call per document at indexing time, non-deterministic outputs, harder to debug. Can be worth it for small high-value corpora.
+- **All three break under the same failure mode:** if the document genuinely has no semantic structure (a chaotic dump, mixed-topic emails, scraped web noise), no chunking strategy saves you. Clean the input first.
+
+**For WCA specifically.** Structure-aware is the obvious choice — the
+hierarchical IDs (`11e`, `11e+`, `11e1`, `11e2a`) are explicit, machine-readable
+markers of what belongs together. Embedding-based would be a regression: it
+would rediscover, imperfectly, the structure already encoded in the IDs. See
+the `Chunking` entry above for the WCA-specific decision and trade record.
+
+**Connection to your day job.** Structure-aware chunking is the same instinct
+as a well-designed SQL schema: respect the natural keys and relationships
+already in the data, don't impose an arbitrary one. Embedding-based chunking
+is closer to a clustering job — group rows by similarity and accept that the
+cuts won't always land where a human would put them.
+
+**Further reading.**
+- Greg Kamradt, "5 Levels of Text Splitting" — walks all three flavors plus naive baselines, with code.
+- LlamaIndex docs on `SemanticSplitterNodeParser` — reference implementation of embedding-based splitting.
+- LangChain's `MarkdownHeaderTextSplitter` — canonical structure-aware splitter for markdown.
+
+---
+
 ## Chunk metadata
 
 **What it is.** Per-chunk structured data attached alongside the text.
@@ -134,6 +182,69 @@ predicates. Metadata is everything else — and you filter on it the same way
 you'd filter a SQL query.
 
 ---
+
+## Metadata-prepend (what you embed ≠ what you display)
+
+**What it is.** A pattern where the text fed to the embedder is *not* the
+same string that gets returned to the user or sent to the generator. The
+embedder sees a version with extra context prepended — typically the
+parent section title, document name, or hierarchical path. The display
+text stays clean.
+
+For WCA, every chunk carries two text fields:
+
+- `text` — the raw regulation body. What the LLM sees as context. What gets cited.
+- `text_for_embedding` — the same body with `Article {N}: {Title}\nRegulation {id}` prepended. What goes through the embedder.
+
+So `11e` gets embedded as something like:
+
+> Article 11: Incidents <br>
+> Regulation 11e <br>
+> [regulation body...] 
+
+…but if it's retrieved, the LLM only sees the body and the metadata fields
+separately. See `wca_rag/parser.py` (the `flush()` function) for the
+construction.
+
+**Why it matters.**
+- **Embeddings only know what's in the input string.** A chunk that just says "The competitor must signal the WCA Delegate within 10 minutes" has no idea it belongs to Article 11 ("Incidents"). A query like "incident reporting deadline" might miss it because the literal word "incident" never appears in the chunk text.
+- **It's a form of cheap, lossless context expansion.** You pay no inference cost, no extra storage, no extra retrieval complexity — you just front-load the parent context into the string before embedding.
+- **It separates two jobs that should be separate.** Embedding wants *all* the disambiguating context. Display wants the *minimum* clean text the user needs. Conflating them either pollutes the LLM's context window with redundant headers or starves the embedder of context.
+
+**The broader pattern.** This is one instance of "what you embed isn't always
+what you display." Other instances of the same pattern:
+
+- **Hypothetical questions for embedding.** Generate likely questions a chunk could answer, embed those, store the chunk for display. (HyDE-adjacent at index time.)
+- **Summaries for embedding, full text for display.** Embed a short LLM-generated summary; return the long original on retrieval. Useful for very long chunks whose embeddings would otherwise be diluted.
+- **Translations for embedding.** Embed an English translation; display the source language. Useful when the embedding model is much stronger in English than in the source language.
+
+The unifying principle: the embedding string is a *retrieval key*, not the
+content itself. Optimize the key for retrieval, optimize the content for the
+LLM and the user.
+
+**Tradeoffs.**
+- **You're paying for embedding tokens you don't display.** Negligible at this scale (a few extra tokens per chunk, embedded once), but matters if you're on a paid embedding API and your prepend is heavy.
+- **The prepended context dominates the embedding for very short chunks.** A 20-word regulation prepended with a 15-word header becomes "mostly header." For WCA this is mild because most chunks are long enough that the prepend is a small fraction. Worth checking on the shortest chunks (`Article 9`, ~50 chars) once retrieval is running.
+- **Asymmetric query side.** For this trick to actually help, the query embedding has to land near where the prepended chunks now live. With `bge-small`, the query-side instruction prefix (`"Represent this sentence for searching relevant passages: ..."`) handles part of this; explicit query rewriting handles the rest.
+- **Drift risk.** Two text fields means two things to keep in sync. If you ever re-derive `text_for_embedding` from `text` + metadata, do it in one place (the parser) so the format doesn't fork.
+
+**For WCA specifically.** The prepend is `Article {N}: {Title}\nRegulation
+{id}`. This buys two things: (1) chunks that don't mention their article by
+name still match queries phrased in article-level terms ("rules about
+incidents"), (2) the `regulation_id` is in the embedded text, so queries that
+reference an ID directly ("what does 11e say about...") have a direct lexical
+hook for the embedding to grab onto.
+
+**Connection to your day job.** Same shape as a generated/derived column in
+SQL: the canonical data lives in one column, but you persist a derived form
+optimized for a specific lookup pattern (an indexed lowercase copy for
+case-insensitive search, a tsvector for full-text). `text` is the canonical
+column, `text_for_embedding` is the derived index-optimized form. You wouldn't
+display the tsvector to users; same logic here.
+
+**Further reading.**
+- Anthropic's "Contextual Retrieval" blog post — production-scale version of this pattern, where the prepended context is LLM-generated per chunk rather than templated. Same principle, much heavier mechanism.
+- Pinecone, "Chunking Strategies" — touches on context prepending under "metadata enrichment."
 
 ## Cross-references and graph-augmented retrieval
 
