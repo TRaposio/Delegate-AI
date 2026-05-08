@@ -1,0 +1,9 @@
+{
+  "model_name": "BAAI/bge-small-en-v1.5",
+  "embedding_dim": 384,
+  "normalized": true,
+  "n_chunks": 108,
+  "chunks_text_hash": "15d25dc1e492ca874e97640cb7f44233814931a0",
+  "created_at": "2026-05-08T22:05:48.570246+00:00",
+  "embedder_version": "1.0"
+}

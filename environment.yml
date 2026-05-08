@@ -12,4 +12,5 @@ dependencies:
   - tqdm
   - pip
   - pip:
-      - google-generativeai
+      - python-dotenv
+      - google-genai

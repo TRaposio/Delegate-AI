@@ -199,6 +199,28 @@ def _extract_cross_references(text: str) -> list[CrossRef]:
     return out
 
 
+def _strip_cross_reference_markup(text: str) -> str:
+    """Strip `[Display Text](regulations:...)` markdown links to just
+    the display text.
+
+    The WCA regulations encode cross-references as markdown links —
+    `[Regulation A6c](regulations:regulation:A6c)`. Cross-reference
+    metadata is captured separately by `_extract_cross_references`;
+    here we collapse the link to its display text so the chunk body
+    reads naturally for the LLM and any downstream display.
+
+    Run this AFTER `_extract_cross_references` so the structured
+    metadata is preserved.
+    """
+    # Match the full markdown link, capturing the display text only.
+    # Pattern: `[anything](regulations:regulation:X)` or `[anything](regulations:article:X)`
+    return re.sub(
+        r"\[([^\]]+)\]\(regulations:(?:regulation|article):[^)]+\)",
+        r"\1",
+        text,
+    )
+
+
 # ----------------------------------------------------------------------------
 # Main parse loop
 # ----------------------------------------------------------------------------
@@ -247,6 +269,10 @@ def parse(markdown_path: Path) -> list[Chunk]:
             return
         body = "\n".join(builder.lines)
         xrefs = _extract_cross_references(body)
+        # Strip cross-reference markdown links from body for display/LLM use.
+        # Must happen AFTER xref extraction (which needs the raw markup) and
+        # BEFORE building text_for_embedding (which embeds the cleaned body).
+        body = _strip_cross_reference_markup(body)
         text_for_embedding = (
             f"Article {builder.article}: {builder.article_title}\n"
             f"Regulation {builder.regulation_id}\n"

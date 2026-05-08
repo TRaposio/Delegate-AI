@@ -29,6 +29,9 @@ Each entry follows the same shape:
 - [Bi-encoder vs cross-encoder](#bi-encoder-vs-cross-encoder)
 - [Query-document asymmetry](#query-document-asymmetry)
 - [Brute-force retrieval (and when to stop)](#brute-force-retrieval-and-when-to-stop)
+- [Hallucination, confabulation, and grounding](#hallucination-confabulation-and-grounding)
+- [The system prompt as a contract](#the-system-prompt-as-a-contract)
+- [Refusal as a first-class output](#refusal-as-a-first-class-output)
 
 ---
 
@@ -740,3 +743,211 @@ are an optimization, not a default.
 - Malkov & Yashunin 2016, *Efficient and robust approximate nearest
   neighbor search using HNSW graphs* — the HNSW paper. Worth reading
   once when ChromaDB stops feeling magical.
+
+
+---
+ 
+## Hallucination, confabulation, and grounding
+ 
+**What it is.** Three related but distinct failure modes in LLM
+generation:
+ 
+- **Hallucination** — the model produces text that is factually wrong
+  in some general sense ("the Eiffel Tower is in Berlin"). Usually
+  framed against world knowledge.
+- **Confabulation** — the model produces a plausible-sounding answer
+  that is not supported by the *specific context it was given*. In
+  RAG, this is when the model invents a citation, paraphrases a
+  retrieved chunk into something it doesn't actually say, or fills in
+  details the chunk omits. The model is not "wrong about the world" —
+  it's wrong about what its sources said.
+- **Grounding** — the property of an answer being traceable to specific
+  source text. A grounded answer can be audited: every claim points
+  back to a passage that supports it. The opposite of confabulation.
+**Why the distinction matters for RAG.** "Reduce hallucinations" is
+the cliché RAG pitch, but in practice the failure mode you're fighting
+is confabulation. The retrieved context might be perfectly correct;
+the model still drifts off it. A delegate asking "is this a +2?" gets
+a confidently wrong answer that *cites a real regulation* but that
+regulation doesn't actually say what the model claims it says. This
+is worse than a non-RAG hallucination because the citation makes it
+look authoritative.
+ 
+**Mechanisms that fight confabulation, in rough order of strength.**
+ 
+1. **Mandatory verbatim quoting** — make the model quote the supporting
+   text before stating its conclusion. Requires the chunk to actually
+   contain the relevant words.
+2. **Quote + justification** — additionally require a one-sentence
+   explanation of *how* the quote supports the conclusion. Catches
+   the failure mode where the model quotes adjacent-but-unrelated
+   text. Justifying an irrelevant quote is hard.
+3. **Refusal as a first-class option** — the model has explicit
+   permission to say "the context doesn't cover this." See the
+   refusal entry below.
+4. **Low temperature** — reduces the chance of a creative leap away
+   from the source. Doesn't prevent confabulation, just makes it less
+   frequent.
+5. **Output validation** — programmatically check that every claim has
+   a citation, every cited id exists in the retrieved set, every quote
+   string actually appears in a retrieved chunk. Mechanical, deferrable
+   to v2 once you've measured how often the prompt alone fails.
+**For WCA specifically.** `prompts.py SYSTEM_PROMPT` uses (1)+(2)+(3).
+(4) is set in `GeminiGenerator` (`temperature=0.1`). (5) is deferred
+— first measure on the golden set whether it's needed.
+ 
+**Connection to your day job.** This is the same shape as the
+difference between a syntactically-valid SQL query and a *correct* SQL
+query. `SELECT user_id FROM orders WHERE total > 100` runs fine but
+returns garbage if `total` is actually called `amount` in your schema.
+The grammar is right; the grounding is wrong. RAG confabulation is
+the LLM equivalent: the answer's *form* is right (citations look
+real, prose is fluent) but the *grounding* is broken.
+ 
+**Further reading.**
+- Ji et al. 2023, *Survey of Hallucination in Natural Language
+  Generation* — taxonomies the failure modes more carefully than
+  practitioners usually do.
+- Anthropic's "Reducing hallucinations" cookbook entries — practical
+  prompting techniques.
+---
+ 
+## The system prompt as a contract
+ 
+**What it is.** The system prompt is not "instructions to a helpful
+assistant." It is a contract that defines (a) what inputs the model
+will receive, (b) what outputs it must produce, (c) what behaviors
+are forbidden, and (d) what to do when the inputs don't fit the
+expected shape. Treating it as a contract — with the same precision
+you'd use for a function signature — produces dramatically more
+reliable behavior than treating it as a friendly request.
+ 
+**Why it matters.** LLMs are extremely good at pattern-matching to the
+shape of the request. A vague prompt ("answer questions about WCA
+regulations and cite your sources") gets a vague contract — the model
+will sometimes cite, sometimes not, sometimes invent ids, sometimes
+refuse, sometimes confabulate. A precise contract ("for every claim:
+state the conclusion, then quote the supporting text in quotation
+marks, then explain in one sentence how the quote supports the
+conclusion, then cite the regulation in square brackets") gets a
+precise contract — the model produces that exact shape almost every
+time.
+ 
+**The structure that works.** Most reliable system prompts have these
+parts in this order:
+ 
+1. **Role + audience** — who the model is, who it's serving, what the
+   stakes are. ("You are advising a WCA delegate at a competition.
+   Wrong answers affect competitor results.")
+2. **Available inputs + their shape** — what the user prompt will
+   contain, in what format. ("You will receive WCA regulations chunks
+   wrapped in `<regulation>` tags.")
+3. **Hard constraints** — what the model must not do, no exceptions.
+   ("Do not use prior knowledge of WCA Regulations. Do not cite ids
+   not present in the retrieved chunks.")
+4. **Output mode taxonomy** — explicit named modes the model picks
+   from. (ANSWER / PARTIAL / REFUSE.) Forces a categorical choice
+   instead of a vague "do your best."
+5. **Output structure per mode** — what a valid response looks like
+   inside each mode. (For every claim: conclusion, quote, justification,
+   citation.)
+6. **Worked examples** — at least one example per mode. Examples
+   pattern-match more strongly than instructions; if the prompt says
+   "be concise" but every example is verbose, the model will be
+   verbose.
+**For WCA specifically.** `prompts.py SYSTEM_PROMPT` follows this
+structure. The biggest leverage came from the mode taxonomy + worked
+examples, not from the lengthy instruction text itself.
+ 
+**Tradeoffs.**
+- **Long system prompts cost tokens on every call.** Marginal at this
+  scale; matters once on a paid API or at high QPS. Prompt caching
+  (deferred to v2) addresses this.
+- **A precise contract makes the model less flexible.** That's the
+  point. Flexibility is what causes confabulation. You're trading
+  generality for reliability.
+- **Examples in the prompt anchor the model strongly.** If the
+  examples are wrong (typos, wrong format), the model copies the
+  wrong format. Treat the examples as production code.
+**Connection to your day job.** This is API design. A REST endpoint
+with vague docs ("send some user data, it'll work") gets used in
+incompatible ways and breaks at runtime. A REST endpoint with a
+precise schema, named error codes, and example requests gets used
+correctly. The system prompt is the API contract for the LLM, and
+LLMs respect contracts roughly as well as developers do — which is
+"pretty well, if the contract is clear and the examples are real."
+ 
+**Further reading.**
+- Anthropic's "Be clear, direct, and detailed" prompt-engineering doc.
+- Lilian Weng's blog post on prompt engineering for grounded
+  generation.
+---
+ 
+## Refusal as a first-class output
+ 
+**What it is.** Designing the system so that "I don't have enough
+information to answer this" is a valid, explicit, named output — not
+an exception, not a fallback, not an apology. The model is told
+upfront that refusing is one of its legitimate response modes, with
+its own format and its own examples.
+ 
+**Why it matters.** LLMs are trained to be helpful, which means they
+have a strong prior toward producing *some* answer to *any* question.
+Without explicit permission to refuse, the model will reach for an
+answer even when the context is empty or off-topic. In a legal /
+regulatory / medical setting this is the most dangerous failure mode:
+a confident wrong answer is worse than no answer.
+ 
+The fix is to make refusal not just allowed but *named*. The same way
+you wouldn't have a function that returns either a value or
+`undefined-but-not-really`, you don't want a system prompt where the
+model can either answer or sort-of-mumble-something. Give refusal a
+name (REFUSE, NO_ANSWER, UNCOVERED — pick one), give it a template,
+give it examples, and the model will use it.
+ 
+**Three flavors of refusal.**
+ 
+| Flavor | When | Example |
+|---|---|---|
+| Out-of-domain | The question is not what this system answers | "What's the weather?" → REFUSE |
+| In-domain but uncovered | The question fits the system but the retrieved context doesn't address it | "What's the WCA's social media policy?" — fits Q&A scope, but probably not in the regulations corpus |
+| Ambiguous | The context covers two interpretations and the model can't pick | Two regulations apply differently depending on a fact not stated in the question |
+ 
+**For WCA specifically.** v1 handles the first two via REFUSE.
+The third (ambiguous) is intentionally NOT a separate mode — those
+cases should also REFUSE rather than produce a hedged interpretive
+answer. Hedged interpretations from an AI are exactly what a delegate
+should be escalating to a human, not consuming as guidance.
+ 
+**The taxonomy decision.** Three-way (ANSWER / PARTIAL / REFUSE) was
+chosen over binary (ANSWER / REFUSE) because real questions often
+touch multiple regulations and forcing a binary collapses partial
+coverage into either over-refusing or over-answering. PARTIAL lets
+the model say "regulation X covers half of this; I don't have
+information on the other half" — which is almost always more useful
+than refusing the whole question.
+ 
+**Tradeoffs.**
+- **Refusal-friendly prompts produce more refusals.** If your golden
+  set has many in-domain questions and the system refuses 30% of
+  them, that's a real problem — measure it. The fix is usually
+  better retrieval (k too low, chunks missing relevant content) not
+  weakening the refusal instruction.
+- **Refusal can be over-cautious.** A model told "refuse if uncertain"
+  can refuse cases it should answer. Worked examples in the prompt
+  showing what a *good* ANSWER looks like counterbalance this.
+- **Users hate refusals.** True. But "I don't know, ask a senior
+  delegate" beats "the answer is +2" when the answer isn't actually
+  +2. Setting the audience's expectation that refusal is a feature,
+  not a bug, is a UX problem outside the model.
+**Connection to your day job.** Refusal as a first-class output is
+the same idea as having `Optional[T]` / `Result<T, E>` types instead
+of returning `None` or raising an exception from any function. You
+make the failure mode part of the type signature. The caller has to
+handle it explicitly. The function can't pretend a problem didn't
+happen. Same logic, applied to LLM outputs.
+ 
+**Further reading.**
+- Anthropic's "Have Claude say 'I don't know'" cookbook entry.
+- The Constitutional AI paper (Bai et al. 2022) — refusal as an
+  alignment property, not just a UX choice.

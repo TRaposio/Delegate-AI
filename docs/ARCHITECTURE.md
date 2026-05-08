@@ -106,9 +106,9 @@ sane Python API. For learning purposes, the vector-similarity math is so
 simple at this corpus size that we can also write a from-scratch numpy version
 as a learning exercise alongside Chroma — to be discussed.
 
-### 3.3 Generation LLM 🟡
+### 3.3 Generation LLM 🟢
 
-**Proposed:** Google Gemini API (`gemini-2.5-flash`, free tier).
+**Decided:** Google Gemini API (`gemini-2.5-flash`, free tier).
 
 | Option | Cost | Quality for citation/refusal | Notes |
 |---|---|---|---|
@@ -120,6 +120,17 @@ as a learning exercise alongside Chroma — to be discussed.
 
 **Rationale:** user requirement is free. Gemini's free tier is the most
 generous from a major lab. Behind a `Generator` interface to swap.
+
+**Implemented.** `wca_rag/generator.py` defines the `Generator` ABC
+with one method (`generate(system_prompt, user_prompt) -> GenerationResult`)
+and one property (`model_name`). Default implementation:
+`GeminiGenerator` wraps `google-generativeai`. Lazy-imports the SDK so
+the rest of the package doesn't pull it in for indexing-only commands.
+Temperature defaults to 0.1 — citation-heavy QA is not creative writing.
+
+**API key.** `GEMINI_API_KEY` read from environment, with `.env`
+support via `python-dotenv` (soft dependency — falls back to plain env
+vars if not installed). `.env.example` checked in. `.env` gitignored.
 
 ### 3.4 Chunking strategy 🟢
 
@@ -296,6 +307,95 @@ not for human display or LLM context). See §3.5.
 
 ---
 
+### 3.9 Generator pipeline 🟢
+
+**Implemented.** Three modules + one CLI entry point:
+
+- `wca_rag/prompts.py` — `SYSTEM_PROMPT` constant +
+  `assemble_user_prompt(question, hits)` helper.
+- `wca_rag/generator.py` — `Generator` ABC +
+  `GeminiGenerator` impl. Returns `GenerationResult` (text + model name
+  + optional token counts).
+- `wca_rag/pipeline.py` — `Pipeline` class composing a Retriever and a
+  Generator into one `ask(question, k=8)` call.
+- `wca_rag/ask.py` — CLI entry point: `python -m wca_rag.ask "your
+  question"`. Prints answer; `--show-hits` flag also prints retrieved
+  chunks for debugging.
+
+**Default k = 8 at query time.** Retriever default remains k=5 (used by
+`query.py` for retrieval-only debugging). Generator pipeline defaults
+to k=8 — multi-regulation questions are common in real delegate
+incidents, and at this corpus size + chunk length the lost-in-the-middle
+risk is negligible (~6k tokens of context). `Pipeline.ask()` accepts a
+`k` override; the CLI exposes it as `-k`.
+
+**System prompt design.** Three load-bearing decisions:
+
+1. **Three-way refusal taxonomy.** ANSWER (chunks fully cover question)
+   / PARTIAL (some coverage, some gaps — answer covered part, state
+   gaps explicitly) / REFUSE (no coverage). Model labels its response
+   with the mode. Binary answer/refuse was rejected because real
+   delegate questions often touch multiple regulations and forcing a
+   binary choice biases toward over-refusing or over-answering.
+
+2. **Mandatory verbatim quoting + justification.** For every claim, the
+   model must (a) state the conclusion, (b) quote the supporting
+   regulation text in quotation marks, (c) explain in one sentence how
+   the quote supports the conclusion. Step (c) is the real
+   anti-confabulation safeguard — quoting alone is not enough because
+   models will quote adjacent-but-irrelevant text. Producing a coherent
+   justification is hard when the quote does not actually fit, which
+   forces the model toward PARTIAL or REFUSE.
+
+3. **Inline citations with bracketed regulation_id.** `[11e]`,
+   `[11e++]`, `[A2b]` immediately after the supported claim. Granular
+   enough to audit per-claim. Examples in the prompt deliberately
+   include `+` suffixes so the model produces them correctly.
+
+**Prompt assembly format.** Each retrieved chunk wrapped in:
+ 
+```
+<regulation id="11e" article="11">
+{chunk["text"]}
+</regulation>
+```
+XML-ish wrapper chosen over plain `[Regulation 11e]` headers for two
+reasons: clearer chunk boundaries (LLMs respect XML-shaped tags well),
+and the citation instruction becomes literal — "cite using the `id`
+attribute". Uses `chunk["text"]`, NOT `chunk["text_for_embedding"]`.
+ 
+**Generator interface: batch only in v1.** Streaming would complicate
+citation parsing (you can't validate citations until the answer is
+fully generated) and the CLI does not benefit. The ABC can grow a
+`stream()` method later without breaking `generate()`.
+ 
+**Deferred to v2:**
+- Streaming output (will arrive with the UI).
+- Structured-output mode (JSON answer + structured citations field).
+  Useful when a UI can render it; noise for a CLI.
+- Prompt caching for the system prompt + retrieved chunks. Free-tier
+  Gemini doesn't benefit; revisit when on a paid API.
+- Two-pass refusal verification (a second LLM call that grades the
+  first one's output). Worth measuring on the golden set first.
+- Output-format validation (does the answer actually contain quoted
+  text + bracketed citations?). Currently trusted to the system prompt.
+
+**Known open issue: citation granularity.** Smoke testing revealed
+that the model cites at sub-regulation granularity (e.g. `[A6c]`,
+`[A6e++]`) even when chunks are at top-level granularity (e.g. `A6`,
+`A6e`). Sub-regulation ids appear inside the body text of their
+parent chunk but not as `id` attributes on `<regulation>` tags. The
+current system prompt says "Only cite ids present in the retrieved
+chunks," which the model interprets loosely (sub-regulation present
+in body) rather than strictly (id attribute on a tag). This is
+*either* a bug (citations should be auditable against the retrieved
+set) *or* a feature (sub-regulation citations are more precise and
+useful for delegates). The decision — explicitly allow Option A or
+explicitly forbid via Option B — is pending and must be resolved
+before the eval harness is built. See SESSION_HANDOFF.md for context.
+
+---
+
 ## 4. End-to-end pipeline
 
 ### Indexing (offline)
@@ -327,10 +427,10 @@ user question
 [retriever]              ──► top-k hits + metadata           ✅ (NumPy; Chroma later)
         │
         ▼
-[prompt assembler]       ──► system prompt + chunks + question  ⬜ next
+[prompt assembler]       ──► system prompt + chunks + question  ✅
         │
         ▼
-[generator]              ──► answer with regulation IDs cited   ⬜ next
+[generator]              ──► answer with regulation IDs cited   ✅
 ```
 
 ---
