@@ -1,66 +1,111 @@
-# Golden set for evaluating the WCA RAG system.
+# Golden set for the WCA RAG eval harness.
 #
-# Each entry is a real or realistic incident scenario with the regulations
-# that a correct answer should cite. The user (a delegate) writes these
-# from competition experience.
+# Format:
+#   id:            stable identifier (q01, q02, ...). Sort key.
+#                  String, not int, so q01a-style insertions don't force
+#                  renumbering downstream.
+#   question:      the delegate's question, verbatim.
+#   expected_mode: ANSWER | PARTIAL | REFUSE
+#   expected_ids:  list of regulation ids that *should* be cited.
+#                  Granularity: claim-level (Option A). Sub-rule ids
+#                  like A6c, 11e++, 3l1a are valid here. For REFUSE,
+#                  use an empty list.
+#   notes:         human-readable rationale for expected mode/ids.
+#                  Future-you reads these in 3 months.
 #
-# Fields:
-#   id:              unique integer
-#   question:        the incident scenario, written as a delegate would phrase it
-#   expected_rules:  list of regulation IDs the answer must reference to be correct.
-#                    Use the canonical ID format from the regulations (e.g. "11e",
-#                    "11e++", "A3c1"). Order doesn't matter.
-#   article:         primary article(s) the incident lives under (for filtering analysis)
-#   difficulty:      easy | medium | hard
-#                    - easy: single rule applies directly
-#                    - medium: multiple rules, requires combining
-#                    - hard: edge case, ambiguous, or requires cross-references
-#   notes:           optional. Why this case is interesting, or what makes it tricky.
+# Loader sorts by id, but a sorted file diffs cleanly. Keep it sorted.
+
+- id: q01
+  question: "Can a competitor stop the timer while still touching the puzzle?"
+  expected_mode: ANSWER
+  expected_ids:
+    - A6c
+  notes: >
+    Smoke-test fixture. A6c directly addresses stopping the timer
+    without first releasing the puzzle (+2 penalty). Citation should
+    be at sub-rule granularity (A6c), not at chunk-parent granularity
+    (A6). Verifies Option A's claim-level citation contract.
+
+- id: q02
+  question: "What is the WCA's policy on logo usage? Can I use the WCA logo on the mugs I want to sell?"
+  expected_mode: PARTIAL
+  expected_ids:
+    - 3l
+    - 3l1
+    - 3j
+  notes: >
+    Two-part question: puzzle-logo policy is in the corpus, merchandise
+    use is not. Model must answer the covered half and explicitly state
+    the uncovered half. The expected_ids list is intentionally
+    representative-not-exhaustive — sub-rules like 3l+, 3l1a, 3l1b,
+    3l2, 3l++ are all reasonable additional citations and the model
+    legitimately produced more than three. Citation accuracy will read
+    high for any reasonable answer here; the load-bearing check is
+    expected_mode = PARTIAL, not the exact citation set.
+
+- id: q03
+  question: "I have a 3x3 fewest moves solution written down. It's half on one sheet of paper and half on another one. If you put the paper close together, it's an unambiguous sequence of moves and it's correct. Can I accept it?"
+  expected_mode: ANSWER
+  expected_ids:
+    - E2c
+  notes: >
+    Edge case for FMC submission rules. E2c specifies a single piece
+    of paper. The strict reading (one physical sheet) is the
+    controlling text and the model takes it. There's a defensible
+    argument this question is genuinely ambiguous and should REFUSE
+    (procedural judgment call escalates to human delegate, per
+    CONCEPTS.md "Refusal as a first-class output"). For v0 we tag it
+    ANSWER and accept the strict reading; a separate explicitly-
+    ambiguous fixture should be added later to measure ambiguity-
+    handling distinct from rule-lookup.
+
+
+# ----------------------------------------------------------------------------
+# MIGRATION NOTE — old golden set entries (pre-eval-harness schema)
+# ----------------------------------------------------------------------------
 #
-# Aim for ~20 entries spanning easy/medium/hard and multiple articles.
-# Include cases the system will likely fail on — those are the most valuable.
-
-- id: 1
-  question: >
-    A competitor finishes their solve and signs the scorecard. Five minutes
-    later they tell me a judge bumped them mid-solve and they want an extra.
-    Can I grant it?
-  expected_rules: ["11e", "11e++++", "11e+++"]
-  article: "11"
-  difficulty: easy
-  notes: >
-    11e++++ explicitly states the attempt is finished after signing the score
-    sheet. 11e+++ says stronger discretion should apply post-finish. 11e is
-    the parent rule on extra attempts and timing of appeals.
-
-- id: 2
-  question: >
-    During a 3x3 final, the venue fire alarm goes off in the middle of a
-    competitor's solve. What do I do?
-  expected_rules: ["11a2", "11b", "11e"]
-  article: "11"
-  difficulty: easy
-  notes: >
-    11a2 explicitly lists facility interruptions including alarms.
-
-- id: 3
-  question: >
-    A scrambler tells me after the group that they realized they used the
-    same scramble twice for one competitor. The competitor has already
-    finished. What's the call?
-  expected_rules: ["11j", "11j3"]
-  article: "11"
-  difficulty: easy
-  notes: >
-    Duplicate scramble noticed during competition but after the group → 11j3
-    requires extra attempt.
-
-# TEMPLATE — duplicate this block for new entries:
-# - id: N
+# These three entries existed before the eval harness. They're real
+# delegate scenarios worth keeping, but the schema doesn't match the
+# current one (no expected_mode, integer ids, expected_rules vs
+# expected_ids, plus extra article/difficulty fields).
+#
+# To migrate: pick a question, decide its expected_mode (likely ANSWER
+# for all three since they describe in-scope incidents), rename
+# expected_rules → expected_ids, drop or fold article/difficulty into
+# notes, give it a q-prefixed string id.
+#
+# Original entries:
+#
+# - id: 1
 #   question: >
-#     ...
-#   expected_rules: ["..."]
-#   article: "..."
-#   difficulty: easy | medium | hard
+#     A competitor finishes their solve and signs the scorecard. Five minutes
+#     later they tell me a judge bumped them mid-solve and they want an extra.
+#     Can I grant it?
+#   expected_rules: ["11e", "11e++++", "11e+++"]
+#   article: "11"
+#   difficulty: easy
 #   notes: >
-#     ...
+#     11e++++ explicitly states the attempt is finished after signing the
+#     score sheet. 11e+++ says stronger discretion should apply post-finish.
+#     11e is the parent rule on extra attempts and timing of appeals.
+#
+# - id: 2
+#   question: >
+#     During a 3x3 final, the venue fire alarm goes off in the middle of a
+#     competitor's solve. What do I do?
+#   expected_rules: ["11a2", "11b", "11e"]
+#   article: "11"
+#   difficulty: easy
+#   notes: 11a2 explicitly lists facility interruptions including alarms.
+#
+# - id: 3
+#   question: >
+#     A scrambler tells me after the group that they realized they used the
+#     same scramble twice for one competitor. The competitor has already
+#     finished. What's the call?
+#   expected_rules: ["11j", "11j3"]
+#   article: "11"
+#   difficulty: easy
+#   notes: >
+#     Duplicate scramble noticed during competition but after the group →
+#     11j3 requires extra attempt.

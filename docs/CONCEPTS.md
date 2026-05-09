@@ -32,6 +32,7 @@ Each entry follows the same shape:
 - [Hallucination, confabulation, and grounding](#hallucination-confabulation-and-grounding)
 - [The system prompt as a contract](#the-system-prompt-as-a-contract)
 - [Refusal as a first-class output](#refusal-as-a-first-class-output)
+- [Chunk-level vs claim-level citation granularity](#chunk-level-vs-claim-level-citation-granularity)
 
 ---
 
@@ -951,3 +952,86 @@ happen. Same logic, applied to LLM outputs.
 - Anthropic's "Have Claude say 'I don't know'" cookbook entry.
 - The Constitutional AI paper (Bai et al. 2022) — refusal as an
   alignment property, not just a UX choice.
+---
+
+## Chunk-level vs claim-level citation granularity
+
+**What it is.** In a RAG system that requires citations, the granularity of
+the citation is a separate design choice from the granularity of retrieval.
+Retrieval operates on chunks — that's the unit the embedder embeds and the
+retriever returns. Citations don't have to. If a chunk's body contains
+structured sub-units with their own identifiers (sub-regulations,
+sub-sections, paragraph numbers), the citation can be at sub-unit
+granularity even when the chunk itself is at parent granularity.
+
+The two ends of the spectrum:
+
+- **Chunk-level (Option B):** the cited id must be the chunk's own
+  identifier. Easy to validate as set membership ("is this id in the
+  retrieved set?"). Loses precision — a claim supported only by
+  sub-regulation `A6c` is cited as `[A6]`.
+- **Claim-level (Option A):** the cited id is the most specific identifier
+  whose verbatim text appears in the retrieved chunk's body, even when
+  that's a sub-unit nested inside the chunk. More precise. Validation
+  shifts from id-set-membership to verbatim-quote-substring-match.
+
+**Why it matters.** This is the design tradeoff that makes "auditable
+citations" mean different things. Under chunk-level, the auditor checks the
+*label* (is the id from the retrieved set?) but not the *content* (is the
+claim actually supported by the cited regulation?). A model can cite `[A6]`
+correctly-by-label for a claim that only `A6c` actually supports. Under
+claim-level, the verbatim-quote requirement is what ties citation to
+content — every cited id must come with a quote that string-matches the
+retrieved chunks. The quote is the audit, not the id.
+
+**For WCA specifically.** The corpus has explicit hierarchical ids (`11e`,
+`11e+`, `11e1`, `A6c`) at multiple levels of nesting. Chunks are at
+top-level granularity (one chunk per top-level regulation, bundling its
+annotations and children). A claim like "the competitor incurs a +2 penalty
+for stopping the timer while still touching the puzzle" is supported
+specifically by `A6c`, which lives inside chunk `A6e`'s body. Under
+chunk-level the citation would be `[A6e]`, which a delegate then has to
+scan to find the actual sub-rule. Under claim-level the citation is
+`[A6c]`, which is what the delegate needs.
+
+**Tradeoffs.**
+
+- **Validation complexity.** Chunk-level: set membership. Claim-level:
+  substring match on verbatim quotes (whitespace-normalized) plus a
+  confabulation check (is the cited id present anywhere in the retrieved
+  text?). Roughly the same code; different shape.
+- **Failure modes.** Claim-level fails loudly — an invented sub-rule id
+  fails the substring check. Chunk-level fails silently — a chunk-level
+  citation can be wrong about which sub-rule supports the claim without
+  tripping any check, because the check only looks at the label.
+- **Prompt complexity.** Claim-level needs explicit instruction that
+  sub-rule citations are permitted, plus a "prefer the narrowest id"
+  preference. Chunk-level needs explicit instruction that sub-rule
+  citations are forbidden, plus a fallback for when only a sub-rule
+  supports a claim. Roughly equal complexity.
+- **Verbatim-quote dependency.** Claim-level relies on the verbatim-quote
+  requirement being honored. If the prompt is later relaxed to allow
+  paraphrase, the granularity decision needs to be revisited at the same
+  time.
+
+**Decision for this project: claim-level (Option A).** The precision win
+for delegate UX is concrete (cite the rule they need to read, not the
+section that contains it), and the validator complexity is comparable. The
+verbatim-quote contract is what makes it auditable in practice. See
+ARCHITECTURE.md §3.9 and the eval harness in `wca_rag/eval.py`.
+
+**Connection to your day job.** The same idea shows up in API design as
+"return the most specific resource that answers the question, not its
+parent collection." A pagination endpoint that returns a page of results
+when the caller asked for one specific record is technically correct (the
+record is in the page) but operationally poor — the caller has to filter
+the response themselves. Citation granularity is the same shape: returning
+the parent regulation when only a child supports the claim is technically
+correct but pushes work to the human consumer.
+
+**Further reading.**
+- The verbatim-quote-then-explain pattern in citation prompting is from
+  Anthropic's prompt-engineering docs ("ground responses in source text").
+- LangChain's "citation" tutorial frames the granularity question
+  briefly; most public RAG tutorials don't address it explicitly because
+  most corpora don't have explicit sub-unit identifiers.

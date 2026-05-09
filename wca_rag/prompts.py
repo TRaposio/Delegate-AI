@@ -48,6 +48,15 @@ if TYPE_CHECKING:
 # - Citation format: inline [regulation_id] immediately after the claim
 #   it supports. Granular enough to audit; readable enough for a CLI.
 #
+# - Citation granularity: claim-level, not chunk-level (Option A). The
+#   model may cite sub-regulation ids (e.g. [A6c], [11e++]) when their
+#   verbatim text appears inside a retrieved chunk's body, even though
+#   chunks themselves are at top-level granularity. The verbatim-quote
+#   requirement is what makes this auditable: every cited id must be
+#   backed by a quote that string-matches the retrieved set. See
+#   ARCHITECTURE.md §3.9 and CONCEPTS.md "Chunk-level vs claim-level
+#   citation granularity".
+#
 # - Examples in the prompt deliberately include WCA's unusual ID
 #   suffixes (11e++, A2b, 9f1) so the model produces them correctly.
 #   Without examples, models tend to drop the + suffixes.
@@ -98,13 +107,21 @@ have grounds to state that conclusion. Switch to PARTIAL or REFUSE.
 
 # Citation format
 
-- Cite using the regulation id from the `id` attribute of the \
-<regulation> tag, in square brackets, immediately after the supported \
-claim. Examples: [11e], [11e++], [A2b], [9f1].
+- Cite the most specific regulation id whose verbatim text in the \
+retrieved chunks supports your claim. The id may appear either as the \
+`id` attribute of a <regulation> tag OR inside the body text of a \
+retrieved chunk (sub-regulations like `11e1`, annotations like `11e++`, \
+and nested children like `A2b` are all valid citation targets when \
+their text is present in a retrieved chunk).
+- Place the citation in square brackets, immediately after the \
+supported claim. Examples: [11e], [11e++], [A2b], [9f1].
 - Preserve `+` suffixes exactly as they appear. `11e` and `11e++` are \
 different regulations.
-- Do not invent regulation ids. Only cite ids present in the retrieved \
-chunks.
+- Prefer the narrowest id that fully supports the claim. If only the \
+text labeled `A6c` supports a claim, cite [A6c], not [A6].
+- Every citation must be backed by a verbatim quote from the retrieved \
+chunks (per the mandatory structure above). If you cannot find verbatim \
+text for a candidate id, you may not cite that id.
 
 # Style
 
