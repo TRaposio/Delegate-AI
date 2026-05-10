@@ -124,9 +124,11 @@ generous from a major lab. Behind a `Generator` interface to swap.
 **Implemented.** `wca_rag/generator.py` defines the `Generator` ABC
 with one method (`generate(system_prompt, user_prompt) -> GenerationResult`)
 and one property (`model_name`). Default implementation:
-`GeminiGenerator` wraps `google-generativeai`. Lazy-imports the SDK so
-the rest of the package doesn't pull it in for indexing-only commands.
-Temperature defaults to 0.1 — citation-heavy QA is not creative writing.
+`GeminiGenerator` wraps `google-genai` (the current SDK;
+`google-generativeai` is deprecated and must not be used).
+Lazy-imports the SDK so the rest of the package doesn't pull it in
+for indexing-only commands. Temperature defaults to 0.1 —
+citation-heavy QA is not creative writing.
 
 **API key.** `GEMINI_API_KEY` read from environment, with `.env`
 support via `python-dotenv` (soft dependency — falls back to plain env
@@ -380,19 +382,30 @@ fully generated) and the CLI does not benefit. The ABC can grow a
 - Output-format validation (does the answer actually contain quoted
   text + bracketed citations?). Currently trusted to the system prompt.
 
-**Known open issue: citation granularity.** Smoke testing revealed
-that the model cites at sub-regulation granularity (e.g. `[A6c]`,
-`[A6e++]`) even when chunks are at top-level granularity (e.g. `A6`,
-`A6e`). Sub-regulation ids appear inside the body text of their
-parent chunk but not as `id` attributes on `<regulation>` tags. The
-current system prompt says "Only cite ids present in the retrieved
-chunks," which the model interprets loosely (sub-regulation present
-in body) rather than strictly (id attribute on a tag). This is
-*either* a bug (citations should be auditable against the retrieved
-set) *or* a feature (sub-regulation citations are more precise and
-useful for delegates). The decision — explicitly allow Option A or
-explicitly forbid via Option B — is pending and must be resolved
-before the eval harness is built. See SESSION_HANDOFF.md for context.
+**Citation granularity: Option A (claim-level) 🟢.** The model cites
+the most specific id whose verbatim text appears in a retrieved
+chunk, including sub-regulations nested inside chunk bodies (e.g.
+`[A6c]` cited from inside chunk `A6`'s body, not just `[A6]`).
+Sub-regulation ids appear in chunk text but not as `id` attributes
+on `<regulation>` tags, so the constraint is now phrased as "cite
+ids whose text is present in a retrieved chunk" — the verbatim quote
+is the load-bearing audit, not the tag attribute.
+
+Implications:
+- **`prompts.py`** patched with the explicit "prefer narrowest id"
+  preference and a worked example using a sub-rule citation.
+- **Eval harness** scores citation accuracy at claim-level (no
+  sub-rule collapsing). Recall@k is the only place sub-rule ids are
+  collapsed to parent chunks, because the retriever returns chunks.
+- **Confabulation check** scans retrieved chunk bodies for each cited
+  id; if not present, the model invented it — hard failure
+  regardless of mode or accuracy.
+- **Quote validity** is measured programmatically (substring match
+  against retrieved chunks, whitespace-normalized) and replaces the
+  eyeball check the verbatim-quote rule otherwise relies on.
+
+See `CONCEPTS.md` ("Chunk-level vs claim-level citation granularity")
+for the full reasoning.
 
 ---
 
@@ -435,27 +448,113 @@ user question
 
 ---
 
-## 5. Evaluation strategy 🟡
+## 5. Evaluation strategy 🟢
 
-**Golden set:** `evals/golden_set.yaml`, 15–30 hand-written incident
-questions with expected regulation IDs.
+**Built.** `wca_rag/eval.py` is a three-phase, cache-on-disk harness.
+Each phase writes to `evals/results/run-<TIMESTAMP>/` so the
+expensive phases don't have to re-run when the scorer changes.
 
-**Metrics for v1:**
-- **Retrieval recall@k**: of expected regulation IDs, how many are in top-k retrieved chunks?
-- **Citation accuracy**: does the final answer reference the expected IDs?
-- **Manual quality grade**: 1–5 from the user, on a sample.
+### Why three phases
 
-**Scoring nuance:** golden set lists `expected_rules` at sub-chunk granularity
-(e.g. `11e++++`, `11j3`), but chunks are at top-level only (`11e`, `11j`).
-When computing recall@k, sub-rule IDs must be collapsed to their parent chunk
-ID before scoring, otherwise valid retrievals look like misses. Handled in
-`wca_rag/eval.py`.
+Retrieval is fast, deterministic, and free (local embedder).
+Generation is rate-limited and quota-eating (Gemini free tier:
+~10 RPM, ~250 RPD as of 2026-04). Scoring is the part that gets
+iterated on. If all three ran in one pass, every scorer change
+would cost generator quota. By caching phase 1 and phase 2 outputs,
+phase 3 becomes a pure function over those artifacts and re-runs
+in milliseconds.
 
-**Metrics deferred to v2:**
-- Faithfulness (does the answer follow from retrieved context?)
-- Answer relevance
-- LLM-as-judge automated grading
-- RAGAS / TruLens / DeepEval framework integration
+- **Phase 1 — Retrieve.** Run the retriever for each question with
+  configurable k. No LLM calls. Output: `hits.json`.
+- **Phase 2 — Generate.** Load cached hits, assemble user prompt,
+  call generator. Sleep between calls to respect RPM. Fail loudly
+  on 429 — silent retries hide systematic problems.
+  Output: `answers.json`.
+- **Phase 3 — Score.** Pure function over the cached artifacts.
+  Output: `metrics.json` + `summary.txt`.
+
+### Metrics (v1)
+
+Six metrics, all computed in phase 3:
+
+- **Recall@k** — fraction of expected ids whose parent chunk is in
+  the retrieved set. Sub-rule expected ids are collapsed to parent
+  chunks for this check (the retriever returns chunks, not sub-rules).
+- **Citation accuracy** — fraction of expected ids cited in the
+  answer. Claim-level under Option A; no sub-rule collapsing.
+- **Citation precision** — fraction of cited ids that were expected.
+  Often <1.0 by design when the golden set lists representative ids
+  rather than exhaustive ones.
+- **Quote validity** — fraction of `"..."` spans in the answer that
+  substring-match a retrieved chunk after whitespace normalization.
+  This is the programmatic replacement for eyeball-checking the
+  verbatim-quote requirement.
+- **Mode accuracy + confusion matrix** — declared mode vs expected
+  mode (ANSWER / PARTIAL / REFUSE). Confusion matrix shows where
+  collapses happen (e.g. ANSWER → PARTIAL).
+- **Confabulation count** — cited ids whose text is not present in
+  any retrieved chunk. Hard failure regardless of other metrics.
+
+### Run artifacts
+
+```
+evals/results/run-<TIMESTAMP>/
+    config.json     # golden_set hash, prompt hash, model, k, rpm, timestamp
+    hits.json       # phase 1 output
+    answers.json    # phase 2 output
+    metrics.json    # phase 3 output (per-question scores + aggregate)
+    summary.txt     # human-readable aggregate, written every run
+```
+
+`config.json` records `golden_set_hash` (sha256 of sorted YAML),
+`prompt_hash` (sha256 of `SYSTEM_PROMPT`), and model name. Two runs
+with matching hashes + model are comparable; mismatches mean you're
+comparing tuning experiments, not the same system.
+
+### CLI
+
+```
+python -m wca_rag.eval                       # full run; writes summary.txt
+python -m wca_rag.eval --questions q01,q02   # subset
+python -m wca_rag.eval --rpm 10              # rate limit override
+python -m wca_rag.eval --summary             # also print aggregate to stdout
+python -m wca_rag.eval --score-only RUN_ID   # rescore cached run; rewrites
+                                             # metrics.json + summary.txt
+```
+
+`summary.txt` is always written (full run and `--score-only`).
+`--summary` only controls whether the aggregate is also printed to
+stdout. `--score-only` overwrites `metrics.json` and `summary.txt`
+in place — fine while iterating on the scorer; if scorer-versioned
+output becomes useful, add a `--tag` flag to write
+`metrics.<tag>.json` instead.
+
+### Golden set
+
+`evals/golden_set.yaml`. Schema:
+
+```yaml
+- id: q01                       # string, sortable
+  question: "..."
+  expected_mode: ANSWER         # ANSWER | PARTIAL | REFUSE
+  expected_ids: [A6c]           # claim-level granularity (Option A)
+  notes: "..."                  # human-readable rationale
+```
+
+Currently 3 fixtures (v0). Target for v1 is 15-30 hand-written
+incident questions.
+
+### Deferred
+
+- **LLM-as-judge scoring** (faithfulness, answer relevance). Defer
+  until baseline metrics are stable.
+- **Token-bucket rate limiting with retry.** Sleep-between-calls is
+  fine for ~30-question runs. Revisit at 100+.
+- **Per-question retry on transient errors.** Fail loudly; silent
+  retries hide systematic problems.
+- **Run-diff tooling.** Useful later. Eyeball + `jq` + `summary.txt`
+  is fine for now.
+- **RAGAS / TruLens / DeepEval framework integration.**
 
 ---
 
@@ -467,6 +566,7 @@ wca-rag/
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── OPEN_QUESTIONS.md
+│   ├── SESSION_HANDOFF.md  # cross-session state
 │   └── CONCEPTS.md         # learning notes — RAG concepts as we hit them
 ├── README.md
 ├── pyproject.toml          # or environment.yml for conda
@@ -482,8 +582,9 @@ wca-rag/
 │   ├── pipeline.py         # orchestration
 │   ├── prompts.py          # prompt templates
 │   ├── index.py            # entry point: build the index
-│   ├── query.py            # entry point: ask one question
-│   └── eval.py             # entry point: run golden set
+│   ├── query.py            # entry point: retrieval-only debug
+│   ├── ask.py              # entry point: one question end-to-end
+│   └── eval.py             # entry point: three-phase eval harness
 │
 ├── data/
 │   ├── raw/
