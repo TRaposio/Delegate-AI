@@ -165,15 +165,19 @@ def format_chunk(hit: "RetrievalHit") -> str:
     article attribute is contextual (cheap to include, occasionally
     useful for the LLM to disambiguate similar ids across articles).
 
+    Reads `regulation_id` and `article` directly off the hit (explicit
+    attributes), and `text` off `hit.chunk`. The narrower the dict-key
+    access here, the less coupling between prompt assembly and the
+    parser's chunk schema — eval.py reconstructs hits from cached data
+    and only needs to supply the `text` key.
+
     Uses chunk["text"] (raw body), NOT chunk["text_for_embedding"]. The
     embedding-side header was added to help the embedder retrieve short
     chunks; including it in the LLM context would just be noise.
     """
-    chunk = hit.chunk
     return (
-        f'<regulation id="{chunk["regulation_id"]}" '
-        f'article="{chunk["article"]}">\n'
-        f'{chunk["text"]}\n'
+        f'<regulation id="{hit.regulation_id}" article="{hit.article}">\n'
+        f'{hit.chunk["text"]}\n'
         f"</regulation>"
     )
 

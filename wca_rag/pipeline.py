@@ -20,10 +20,15 @@ from wca_rag.retriever import RetrievalHit, Retriever
 
 
 # k=8 default: see ARCHITECTURE.md §3.9. Higher than retriever's k=5
-# default because the generator benefits from headroom (multi-regulation
-# questions are common) and lost-in-the-middle is not a concern at this
-# corpus size and chunk length.
-DEFAULT_K = 8
+# default (RETRIEVAL_DEFAULT_K) because the generator benefits from
+# headroom (multi-regulation questions are common) and lost-in-the-
+# middle is not a concern at this corpus size and chunk length.
+#
+# Naming: deliberately distinct from RETRIEVAL_DEFAULT_K so a stray
+# `from wca_rag.retriever import DEFAULT_K` vs `from wca_rag.pipeline
+# import DEFAULT_K` cannot silently produce different k's depending on
+# which module a caller imported from.
+PIPELINE_DEFAULT_K = 8
 
 
 @dataclass
@@ -50,7 +55,7 @@ class Pipeline:
         self._retriever = retriever
         self._generator = generator
 
-    def ask(self, question: str, k: int = DEFAULT_K) -> PipelineResult:
+    def ask(self, question: str, k: int = PIPELINE_DEFAULT_K) -> PipelineResult:
         if not question or not question.strip():
             raise ValueError("question must be a non-empty string")
 

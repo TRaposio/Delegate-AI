@@ -29,7 +29,6 @@ from wca_rag.embedder import Embedder, SentenceTransformerEmbedder
 
 DEFAULT_CHUNKS_PATH = Path("data/chunks.jsonl")
 DEFAULT_OUT_DIR = Path("data")
-EMBEDDER_VERSION = "1.0"
 
 
 def load_chunks(path: Path) -> list[dict]:
@@ -102,7 +101,6 @@ def build_index(
         "n_chunks": len(chunks),
         "chunks_text_hash": compute_corpus_fingerprint(chunks),
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "embedder_version": EMBEDDER_VERSION,
     }
     with meta_path.open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)

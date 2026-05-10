@@ -25,7 +25,7 @@ function over those artifacts and re-runs in milliseconds.
 PHASES
 ------
 Phase 1 — RETRIEVE (local, fast, deterministic):
-    For each question in the golden set, run the retriever with k=DEFAULT_K.
+    For each question in the golden set, run the retriever with k=PIPELINE_DEFAULT_K.
     Persist the retrieved chunk ids + scores per question.
     No LLM calls. No quota consumed.
     Output: hits.json
@@ -91,11 +91,11 @@ runs of the same system.
 
 CLI
 ---
-    python -m wca_rag.eval                       # all three phases, new run dir
+    python -m wca_rag.eval                       # all three phases, new run dir; writes summary.txt
     python -m wca_rag.eval --questions q01,q02   # subset
     python -m wca_rag.eval --rpm 10              # rate limit override (default 10)
-    python -m wca_rag.eval --summary             # print aggregate to stdout
-    python -m wca_rag.eval --score-only RUN_ID   # re-score existing run
+    python -m wca_rag.eval --summary             # also print aggregate to stdout
+    python -m wca_rag.eval --score-only RUN_ID   # re-score existing run; rewrites metrics.json + summary.txt
 
 GOLDEN SET FORMAT
 -----------------
@@ -137,7 +137,7 @@ from typing import Any
 import yaml
 
 from wca_rag.generator import GeminiGenerator
-from wca_rag.pipeline import DEFAULT_K
+from wca_rag.pipeline import PIPELINE_DEFAULT_K
 from wca_rag.prompts import SYSTEM_PROMPT, assemble_user_prompt
 from wca_rag.retriever import RetrievalHit, Retriever
 
@@ -158,13 +158,15 @@ DEFAULT_RPM = 10
 # labels [ANSWER], [PARTIAL], [REFUSE] which contain only uppercase
 # letters and would otherwise match.
 CITATION_PATTERN = re.compile(r"\[([A-Za-z0-9]+\+*[a-z0-9+]*)\]")
-MODE_LABELS = {"ANSWER", "PARTIAL", "REFUSE"}
 
 # Quote regex. Matches "..." spans. Greedy-by-design — long quotes are
 # fine, the substring check normalizes whitespace before matching.
 QUOTE_PATTERN = re.compile(r'"([^"]+)"')
 
-VALID_MODES = {"ANSWER", "PARTIAL", "REFUSE"}
+# Single source of truth for response modes. Used both to filter
+# citation regex hits (mode labels would otherwise match) and to
+# validate golden-set entries.
+MODES = {"ANSWER", "PARTIAL", "REFUSE"}
 
 
 # ----------------------------------------------------------------------------
@@ -183,9 +185,9 @@ class GoldenQuestion:
     notes: str = ""
 
     def __post_init__(self) -> None:
-        if self.expected_mode not in VALID_MODES:
+        if self.expected_mode not in MODES:
             raise ValueError(
-                f"{self.id}: expected_mode={self.expected_mode!r} not in {VALID_MODES}"
+                f"{self.id}: expected_mode={self.expected_mode!r} not in {MODES}"
             )
 
 
@@ -197,6 +199,7 @@ class HitRecord:
     rank: int
     score: float
     regulation_id: str
+    article: str
     text: str  # full chunk body — the scorer needs it for quote validation
 
 
@@ -298,6 +301,7 @@ def phase_retrieve(
                 rank=h.rank,
                 score=h.score,
                 regulation_id=h.regulation_id,
+                article=h.article,
                 text=h.chunk["text"],
             )
             for h in raw_hits
@@ -339,20 +343,19 @@ def phase_generate(
             if elapsed < delay:
                 time.sleep(delay - elapsed)
 
-        # Rebuild the user prompt from cached hits. We need the original
-        # RetrievalHit shape for assemble_user_prompt; fake the chunk
-        # dict with just the fields prompts.py reads.
+        # Rebuild the user prompt from cached hits. format_chunk reads
+        # `regulation_id` and `article` as attributes off the hit and
+        # only `text` from the chunk dict, so the dict here is minimal
+        # by design — that narrow contract is what makes this
+        # reconstruction safe and stable across parser changes.
         cached_hits = hits_by_question[q.id]
         synthetic_hits = [
             RetrievalHit(
                 rank=h.rank,
                 score=h.score,
                 regulation_id=h.regulation_id,
-                chunk={
-                    "regulation_id": h.regulation_id,
-                    "article": _article_from_id(h.regulation_id),
-                    "text": h.text,
-                },
+                article=h.article,
+                chunk={"text": h.text},
             )
             for h in cached_hits
         ]
@@ -369,19 +372,6 @@ def phase_generate(
             output_tokens=result.output_tokens,
         )
     return answers
-
-
-def _article_from_id(regulation_id: str) -> str:
-    """Best-effort article extraction from a regulation id.
-
-    Used only to populate the `article` attribute on the synthetic
-    chunk dict for prompt assembly. The real chunks have this from the
-    parser; we approximate here to avoid round-tripping through
-    chunks.jsonl during eval.
-    """
-    # Top-level digit articles (11e → 11), top-level appendix letters (A6c → A).
-    m = re.match(r"([A-Z]|\d+)", regulation_id)
-    return m.group(1) if m else ""
 
 
 # ----------------------------------------------------------------------------
@@ -408,7 +398,7 @@ def extract_citations(answer_text: str) -> list[str]:
     scorer dedupes when it needs to.
     """
     found = CITATION_PATTERN.findall(answer_text)
-    return [cid for cid in found if cid not in MODE_LABELS]
+    return [cid for cid in found if cid not in MODES]
 
 
 def extract_quotes(answer_text: str) -> list[str]:
@@ -487,7 +477,7 @@ def score_question(
         citation_precision = 1.0 if not expected_set else 0.0
 
     # --- confabulation: cited id whose text is not in ANY retrieved chunk ---
-    # We check whether the cited id appears as a discrete token in any
+    # We check whether each cited id appears as a discrete token in any
     # retrieved chunk body. The chunks format ids as "3l+) [ANNOTATION]..."
     # — id followed by `)`. We anchor on that rather than \b word
     # boundaries because \b breaks on `+`-suffixed ids: \b is a word/
@@ -499,17 +489,24 @@ def score_question(
     #     (whitespace, `(`, `[`, etc.)
     #   - trailing: `)` (the canonical chunk format), OR whitespace,
     #     OR end-of-string
-    confabulated_ids = []
-    for cid in cited_ids:
-        # (?:^|[^A-Za-z0-9+])  : start, or a char that can't extend the id
-        # {escaped id}
-        # (?:\)|\s|$)          : chunk-format `)`, whitespace, or end
-        pattern = re.compile(
-            rf"(?:^|[^A-Za-z0-9+]){re.escape(cid)}(?:\)|\s|$)"
+    #
+    # Build one alternation regex per call (not per cited id) and scan
+    # each chunk once. Whatever ids we never see are confabulated.
+    # Python's `re` cache would absorb the per-id-compile cost anyway,
+    # but doing it explicitly is clearer and scales linearly in chunks
+    # rather than in (chunks × cited_ids).
+    if cited_ids:
+        id_alternation = "|".join(re.escape(cid) for cid in cited_ids)
+        # Capture the id so we can record which one matched.
+        confab_pattern = re.compile(
+            rf"(?:^|[^A-Za-z0-9+])({id_alternation})(?:\)|\s|$)"
         )
-        found = any(pattern.search(h.text) for h in hits)
-        if not found:
-            confabulated_ids.append(cid)
+        seen_ids: set[str] = set()
+        for h in hits:
+            seen_ids.update(confab_pattern.findall(h.text))
+        confabulated_ids = [cid for cid in cited_ids if cid not in seen_ids]
+    else:
+        confabulated_ids = []
 
     # --- recall@k: parent-chunk-collapse expected ids, check retrieval ---
     recall_hits = 0
@@ -640,25 +637,41 @@ def load_run(run_dir: Path) -> tuple[
 # ----------------------------------------------------------------------------
 
 
-def print_summary(metrics: dict[str, Any]) -> None:
+def format_summary(metrics: dict[str, Any]) -> str:
+    """Render aggregate metrics as a human-readable string.
+
+    Single source of truth for the summary text — both summary.txt and
+    --summary stdout output go through here, so they can't drift.
+    """
     agg = metrics["aggregate"]
-    print()
-    print("=" * 70)
-    print(f"AGGREGATE  (n={agg['n']})")
-    print("=" * 70)
-    print(f"  recall@k mean         {agg['recall_at_k_mean']:.3f}")
-    print(f"  citation accuracy     {agg['citation_accuracy_mean']:.3f}")
-    print(f"  citation precision    {agg['citation_precision_mean']:.3f}")
-    print(f"  quote validity        {agg['quote_validity_mean']:.3f}")
-    print(f"  mode accuracy         {agg['mode_accuracy']:.3f}")
-    print(f"  confabulated ids      {agg['total_confabulated_ids']} "
-          f"(in {agg['questions_with_confabulation']} questions)")
-    print()
-    print("Mode confusion (rows = expected, cols = declared):")
+    lines: list[str] = []
+    lines.append("=" * 70)
+    lines.append(f"AGGREGATE  (n={agg['n']})")
+    lines.append("=" * 70)
+    if agg["n"] == 0:
+        lines.append("  (no questions scored)")
+        lines.append("")
+        return "\n".join(lines)
+    lines.append(f"  recall@k mean         {agg['recall_at_k_mean']:.3f}")
+    lines.append(f"  citation accuracy     {agg['citation_accuracy_mean']:.3f}")
+    lines.append(f"  citation precision    {agg['citation_precision_mean']:.3f}")
+    lines.append(f"  quote validity        {agg['quote_validity_mean']:.3f}")
+    lines.append(f"  mode accuracy         {agg['mode_accuracy']:.3f}")
+    lines.append(
+        f"  confabulated ids      {agg['total_confabulated_ids']} "
+        f"(in {agg['questions_with_confabulation']} questions)"
+    )
+    lines.append("")
+    lines.append("Mode confusion (rows = expected, cols = declared):")
     for expected, row in sorted(agg["mode_confusion"].items()):
         for declared, count in sorted(row.items()):
-            print(f"  {expected:7s} → {declared:7s}  {count}")
-    print()
+            lines.append(f"  {expected:7s} → {declared:7s}  {count}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_summary(run_dir: Path, metrics: dict[str, Any]) -> None:
+    (run_dir / "summary.txt").write_text(format_summary(metrics), encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------
@@ -682,13 +695,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--k",
         type=int,
-        default=DEFAULT_K,
-        help=f"top-k for retrieval (default {DEFAULT_K})",
+        default=PIPELINE_DEFAULT_K,
+        help=f"top-k for retrieval (default {PIPELINE_DEFAULT_K})",
     )
     parser.add_argument(
         "--summary",
         action="store_true",
-        help="print aggregate metrics to stdout after run",
+        help="also print aggregate metrics to stdout (summary.txt is always written)",
     )
     parser.add_argument(
         "--score-only",
@@ -727,9 +740,11 @@ def main(argv: list[str] | None = None) -> int:
         questions = [q for q in questions if q.id in hits and q.id in answers]
         metrics = phase_score(questions, hits, answers)
         write_json(run_dir / "metrics.json", metrics)
+        write_summary(run_dir, metrics)
         print(f"rescored: {run_dir}")
         if args.summary:
-            print_summary(metrics)
+            print()
+            print(format_summary(metrics))
         return 0
 
     # Full run.
@@ -760,9 +775,12 @@ def main(argv: list[str] | None = None) -> int:
         "question_ids": [q.id for q in questions],
     })
 
+    write_summary(run_dir, metrics)
+
     print(f"done: {run_dir}")
     if args.summary:
-        print_summary(metrics)
+        print()
+        print(format_summary(metrics))
     return 0
 
 

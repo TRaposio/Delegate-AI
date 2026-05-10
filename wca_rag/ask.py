@@ -18,9 +18,10 @@ from __future__ import annotations
 import argparse
 import sys
 
+from wca_rag._format import format_hit
 from wca_rag.embedder import SentenceTransformerEmbedder
 from wca_rag.generator import GeminiGenerator
-from wca_rag.pipeline import DEFAULT_K, Pipeline
+from wca_rag.pipeline import PIPELINE_DEFAULT_K, Pipeline
 from wca_rag.retriever import Retriever
 
 
@@ -33,8 +34,8 @@ def main() -> int:
     parser.add_argument(
         "-k",
         type=int,
-        default=DEFAULT_K,
-        help=f"Number of chunks to retrieve (default: {DEFAULT_K}).",
+        default=PIPELINE_DEFAULT_K,
+        help=f"Number of chunks to retrieve (default: {PIPELINE_DEFAULT_K}).",
     )
     parser.add_argument(
         "--show-hits",
@@ -69,11 +70,8 @@ def main() -> int:
         print(f"RETRIEVED CHUNKS (k={args.k})")
         print("=" * 70)
         for hit in result.hits:
-            print(f"\n[{hit.rank}] {hit.regulation_id}  (score: {hit.score:.4f})")
-            body = hit.chunk["text"]
-            snippet = body if len(body) <= 200 else body[:200] + "..."
-            print(f"    {snippet}")
-        print()
+            # Plain (no ANSI) — ask.py output is more often piped/saved.
+            print(format_hit(hit, snippet_chars=200, color=False))
 
     print("=" * 70)
     print("ANSWER")

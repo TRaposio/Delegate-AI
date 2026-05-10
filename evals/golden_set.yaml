@@ -59,53 +59,44 @@
     ambiguous fixture should be added later to measure ambiguity-
     handling distinct from rule-lookup.
 
+- id: q04
+  question: "A competitor finishes their solve and signs the scorecard. Five minutes later they tell me a judge bumped them mid-solve and they want an extra. Can I grant it?"
+  expected_mode: ANSWER
+  expected_ids:
+    - 11e
+    - 11e++++
+    - 11e+++
+  notes: >
+    11e++++ explicitly states the attempt is finished after signing the
+    score sheet. 11e+++ says stronger discretion should apply post-finish.
+    11e is the parent rule on extra attempts and timing of appeals.
 
-# ----------------------------------------------------------------------------
-# MIGRATION NOTE — old golden set entries (pre-eval-harness schema)
-# ----------------------------------------------------------------------------
-#
-# These three entries existed before the eval harness. They're real
-# delegate scenarios worth keeping, but the schema doesn't match the
-# current one (no expected_mode, integer ids, expected_rules vs
-# expected_ids, plus extra article/difficulty fields).
-#
-# To migrate: pick a question, decide its expected_mode (likely ANSWER
-# for all three since they describe in-scope incidents), rename
-# expected_rules → expected_ids, drop or fold article/difficulty into
-# notes, give it a q-prefixed string id.
-#
-# Original entries:
-#
-# - id: 1
-#   question: >
-#     A competitor finishes their solve and signs the scorecard. Five minutes
-#     later they tell me a judge bumped them mid-solve and they want an extra.
-#     Can I grant it?
-#   expected_rules: ["11e", "11e++++", "11e+++"]
-#   article: "11"
-#   difficulty: easy
+- id: q05
+  question: "During a 3x3 final, the venue fire alarm goes off in the middle of a competitor's solve. What do I do?"
+  expected_mode: ANSWER
+  expected_ids:
+    - 11a2
+    - 11b
+    - 11e
+  notes: >
+    11a2 explicitly lists facility interruptions including alarms.
+
+- id: q06
+  question: "A scrambler tells me after the group that they realized they used the same scramble twice for one competitor. The competitor has already finished. What's the call?"
+  expected_mode: ANSWER
+  expected_ids:
+    - 11j
+    - 11j3
+  notes: >
+    Duplicate scramble noticed during competition but after the group
+    11j3 requires extra attempt.
+
+# - id: q07
+#   question: 
+#   expected_mode: 
+#   expected_ids:
+#     - 11j
+#     - 11j3
 #   notes: >
-#     11e++++ explicitly states the attempt is finished after signing the
-#     score sheet. 11e+++ says stronger discretion should apply post-finish.
-#     11e is the parent rule on extra attempts and timing of appeals.
-#
-# - id: 2
-#   question: >
-#     During a 3x3 final, the venue fire alarm goes off in the middle of a
-#     competitor's solve. What do I do?
-#   expected_rules: ["11a2", "11b", "11e"]
-#   article: "11"
-#   difficulty: easy
-#   notes: 11a2 explicitly lists facility interruptions including alarms.
-#
-# - id: 3
-#   question: >
-#     A scrambler tells me after the group that they realized they used the
-#     same scramble twice for one competitor. The competitor has already
-#     finished. What's the call?
-#   expected_rules: ["11j", "11j3"]
-#   article: "11"
-#   difficulty: easy
-#   notes: >
-#     Duplicate scramble noticed during competition but after the group →
+#     Duplicate scramble noticed during competition but after the group
 #     11j3 requires extra attempt.

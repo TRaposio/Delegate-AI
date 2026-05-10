@@ -28,7 +28,7 @@ from wca_rag.embedder import Embedder, SentenceTransformerEmbedder
 
 
 DEFAULT_DATA_DIR = Path("data")
-DEFAULT_K = 5
+RETRIEVAL_DEFAULT_K = 5
 
 
 @dataclass
@@ -38,12 +38,21 @@ class RetrievalHit:
     The score is cosine similarity in [-1, 1]. On normalized embeddings
     with bge-small, expect typical hits in roughly [0.4, 0.85] — see
     scripts/inspect_embeddings.py for distribution stats.
+
+    `article` is duplicated out of `chunk` because callers (prompt
+    assembly, eval cache) read it directly. Having it as an attribute
+    means downstream code does not need to keep a chunk dict around.
     """
     rank: int
     score: float
     regulation_id: str
+    article: str
     chunk: dict  # full chunk dict from chunks.jsonl
 
+    # Custom __repr__ rather than the dataclass default: we want score
+    # rounded to 4dp for log readability and we explicitly suppress
+    # `chunk`, which would otherwise dump the full regulation body into
+    # every log line.
     def __repr__(self) -> str:
         return f"RetrievalHit(rank={self.rank}, score={self.score:.4f}, id={self.regulation_id!r})"
 
@@ -133,7 +142,7 @@ class Retriever:
             embedder=embedder,
         )
 
-    def retrieve(self, query: str, k: int = DEFAULT_K) -> list[RetrievalHit]:
+    def retrieve(self, query: str, k: int = RETRIEVAL_DEFAULT_K) -> list[RetrievalHit]:
         """Embed query, score against all chunks, return top-k.
 
         On normalized embeddings, `embeddings @ query_vec` IS cosine similarity.
@@ -158,6 +167,7 @@ class Retriever:
                 rank=rank,
                 score=float(scores[i]),
                 regulation_id=self.chunk_ids[i],
+                article=self.chunks_by_id[self.chunk_ids[i]]["article"],
                 chunk=self.chunks_by_id[self.chunk_ids[i]],
             )
             for rank, i in enumerate(top_k_idx, start=1)
