@@ -33,6 +33,10 @@ Each entry follows the same shape:
 - [The system prompt as a contract](#the-system-prompt-as-a-contract)
 - [Refusal as a first-class output](#refusal-as-a-first-class-output)
 - [Chunk-level vs claim-level citation granularity](#chunk-level-vs-claim-level-citation-granularity)
+- [MRR (Mean Reciprocal Rank)](#mrr-mean-reciprocal-rank)
+- [Confidence calibration and reliability diagrams](#confidence-calibration-and-reliability-diagrams)
+- [Retrieval-derived vs self-reported confidence](#retrieval-derived-vs-self-reported-confidence)
+- [Faithfulness vs quote validity](#faithfulness-vs-quote-validity)
 
 ---
 
@@ -1035,3 +1039,289 @@ correct but pushes work to the human consumer.
 - LangChain's "citation" tutorial frames the granularity question
   briefly; most public RAG tutorials don't address it explicitly because
   most corpora don't have explicit sub-unit identifiers.
+
+---
+
+## MRR (Mean Reciprocal Rank)
+
+**What it is.** A retrieval metric for ranked results. For each query,
+find the rank of the *first* relevant document in the result list (1 =
+top of list). The reciprocal rank is `1 / rank` (or 0 if nothing relevant
+was retrieved). MRR is the mean of those reciprocal ranks across all
+queries.
+
+```
+RR  = 1 / rank_of_first_relevant_hit   (0 if no hit)
+MRR = mean(RR over queries)
+```
+
+Range: 0 to 1. Rank 1 -> RR=1.0, rank 2 -> 0.5, rank 5 -> 0.2, miss -> 0.
+
+**Why it matters.** Recall@k ignores ordering within the top-k slice: a
+retriever that puts the answer at rank 1 scores identically to one that
+puts it at rank 8. MRR captures "did the right chunk land at the top, or
+did we get lucky that k was big enough?" For RAG specifically, rank
+matters more than it does for general IR because:
+
+- The generator has a limited context window. Rank-1 chunks get more
+  attention than rank-8 chunks (the "lost in the middle" effect).
+- Lower-k retrieval is cheaper in tokens. If MRR is high, you can
+  shrink k without hurting quality.
+- A high recall@k with low MRR is a tell that your retriever is finding
+  the right neighborhood but ranking it poorly — the signal that a
+  reranker (cross-encoder, BM25 + vector hybrid) is the right next
+  upgrade.
+
+**Tradeoffs.**
+
+- Only counts the *first* relevant hit. If the question has multiple
+  expected ids and you want credit for retrieving several, MRR
+  understates that. Pair it with recall@k.
+- Like recall, depends entirely on how "relevant" is defined. Garbage
+  in, garbage out.
+- One miss tanks the metric harder than one bad rank: rank-2 contributes
+  0.5, a miss contributes 0. Worth knowing when interpreting small-n
+  runs.
+
+**Connection to your day job.** Same idea as "where in the search
+results did the user click?" in product analytics. Most users only look
+at rank 1-3; the same is true of LLMs reading retrieved chunks.
+
+**Further reading.**
+
+- Manning, Raghavan, Schütze, *Introduction to Information Retrieval*,
+  ch. 8.
+- NDCG (Normalized Discounted Cumulative Gain) is the next step up:
+  weights rank logarithmically and supports graded relevance, not just
+  binary. Overkill here since our "relevance" is a set membership check.
+
+---
+
+## Confidence calibration and reliability diagrams
+
+**What it is.** A model is **calibrated** if its self-reported
+confidence matches its empirical accuracy. A model that says 0.9 on a
+hundred questions and gets 90 right is calibrated. One that says 0.9
+and gets 50 right is **overconfident**; one that says 0.9 and gets
+99 right is **underconfident**.
+
+A **reliability diagram** is the canonical visualization: bin questions
+by confidence (e.g. [0.5, 0.7), [0.7, 0.85), ...), compute empirical
+accuracy in each bin, plot bars against the diagonal y=x. Bars on the
+diagonal = calibrated. Above = under, below = over.
+
+```
+confidence bin    n   accuracy    interpretation
+[0.95, 1.00]     12   1.00        well-calibrated at the top
+[0.85, 0.95)      5   0.80        slightly overconfident
+[0.70, 0.85)      4   0.50        badly overconfident
+[0.00, 0.70)      9   0.22        appropriately uncertain
+```
+
+**Why it matters.** Calibration is what makes a confidence score
+*operationally useful*. Without it the number is decorative. The
+specific use case driving this in the project: "if confidence > 0.9,
+can I skip review?" That decision only works if accuracy in the
+>=0.9 bucket is reliably high. The reliability diagram answers the
+question by inspection; the **confidence threshold summary** in
+`summary.txt` puts it in numbers.
+
+Two related formal metrics worth knowing about but not yet implemented
+here:
+
+- **Expected Calibration Error (ECE)** — weighted mean of |confidence -
+  accuracy| across bins. One number summarizing the whole diagram.
+- **Brier score** — squared error between confidence and 0/1
+  correctness. Penalizes overconfidence + miscalibration in a single
+  number.
+
+Both need n >= 30 to mean much; with 3-10 questions per bin the noise
+swamps the signal. Eyeballing the reliability diagram is the right
+move at our scale.
+
+**Tradeoffs.**
+
+- LLM self-reported confidence is famously poorly calibrated out of the
+  box (overconfident on plausible-but-wrong answers). The threshold
+  summary tells you *whether* this model is calibrated on *this* corpus;
+  it doesn't fix miscalibration.
+- Calibration measured on the eval set is only as representative as the
+  eval set. The "skip review if >0.9" gate is exactly as trustworthy as
+  the golden set's coverage of real delegate questions.
+- Binning is lossy. A bin of n=2 is barely a statistic. With n<30
+  total the scatter plot (one point per question) often reveals more
+  than the binned diagram.
+
+**Connection to your day job.** Calibration is the same idea as a
+binary classifier's predicted-probability vs observed-frequency check —
+sklearn's `calibration_curve` and `CalibratedClassifierCV` are doing
+exactly this. Probabilistic forecasting (weather, sports) has been
+formalizing this for decades; the Brier score comes from there.
+
+**Further reading.**
+
+- Guo et al. 2017, *On Calibration of Modern Neural Networks* —
+  the paper that put neural-net calibration on the map. Defines ECE
+  formally.
+- Kadavath et al. 2022, *Language Models (Mostly) Know What They Know*
+  — Anthropic paper specifically on LLM self-reported confidence and
+  how well-calibrated it is across tasks.
+- DeGroot & Fienberg 1983, *The comparison and evaluation of forecasters*
+  — the statistics-of-forecasting reference; older but where the
+  framing comes from.
+
+---
+
+## Retrieval-derived vs self-reported confidence
+
+**What it is.** Two complementary ways to get a "how sure are we?"
+number for a RAG answer.
+
+- **Self-reported** — the generator outputs a confidence score
+  (`Confidence: 0.92`) as part of its response. Free but only as
+  trustworthy as the model's introspection.
+- **Retrieval-derived** — compute a confidence proxy from the
+  retrieval scores you already have. Common forms:
+  - **Top-1 cosine** — how good is the best match?
+  - **Top1-Top2 margin** — how much does the best match stand out
+    from the runner-up?
+  - **Top-k mean** — how on-topic is the whole retrieved set?
+  - **Entropy over softmaxed scores** — flat distribution = no clear
+    winner.
+
+These are measuring different things. Retrieval-derived confidence
+answers "did we find the right neighborhood?" Self-reported confidence
+answers "given what was retrieved, did the model believe it could
+answer correctly?" Both can be high while the answer is wrong, but
+they fail in different ways:
+
+- **High retrieval, low self-confidence** — chunks are relevant but
+  the model isn't sure how to apply them. The interpretive layer is
+  the bottleneck.
+- **Low retrieval, high self-confidence** — chunks are barely
+  on-topic but the model wrote a confident-sounding answer anyway.
+  The dangerous pattern: confabulation under low retrieval.
+- **Both high, answer correct** — the easy case.
+- **Both low, answer is REFUSE** — the system working as intended on
+  an out-of-domain question.
+
+**Why it matters.** A single confidence number conflates these. Logging
+both lets the eval harness diagnose *where* uncertainty lives. The
+scatter plot `confidence_vs_correctness.png` shows this directly:
+self-confidence on the x-axis, point size = top-1 retrieval score.
+Big-but-leftward points (high retrieval, low self-confidence) and
+small-but-rightward points (low retrieval, high self-confidence) are
+the diagnostic outliers.
+
+**Tradeoffs.**
+
+- **Self-reported is one prompt change, zero extra compute.** But
+  LLM self-confidence is famously miscalibrated, and the score is in
+  the same forward pass as the answer it's evaluating — circular by
+  construction.
+- **Retrieval-derived is free** (the scores already exist in the index
+  step) but only measures retrieval quality, not answer quality. A
+  perfect top-1 cosine on a chunk the model then misapplies is still
+  a wrong answer.
+- **Self-consistency** (re-sample N times, measure agreement) is a
+  stronger signal than either, but costs Nx generation. Deferred in
+  this project for that reason.
+- **LLM-as-judge** (a separate model grades the first one) is the
+  gold-standard cheap-ish path but adds a new failure mode (the judge
+  hallucinating too). Also deferred.
+
+**Connection to your day job.** Same shape as combining "model
+probability" and "feature drift score" in a production classifier —
+two uncorrelated uncertainty signals catch more failures than either
+alone.
+
+**Further reading.**
+
+- Hendrycks & Gimpel 2017, *A Baseline for Detecting Misclassified and
+  Out-of-Distribution Examples in Neural Networks* — origin of
+  max-softmax-probability as a confidence baseline. The retrieval
+  top-1 score is the same idea.
+- Kadavath et al. 2022 (linked above) covers LLM self-reported
+  confidence specifically.
+- "Selective prediction" / "prediction with rejection" literature for
+  the formal framing of "high confidence -> act, low -> defer to
+  human."
+
+---
+
+## Faithfulness vs quote validity
+
+**What it is.** Two metrics that sound similar but catch different
+failures, both about whether an answer is grounded in retrieved text.
+
+- **Quote validity** — fraction of `"..."` spans in the answer that
+  appear *somewhere* in the retrieved chunk set. Cheap substring
+  match after whitespace normalization.
+- **Faithfulness** (in the RAG-eval literature: RAGAS, TruLens) —
+  whether each *claim* in the answer is entailed by the retrieved
+  context. Usually measured by an LLM-as-judge or NLI model.
+
+Quote validity is easy and free; real faithfulness needs another
+model call. The project uses a programmatic proxy in between called
+**citation-quote alignment**: for each `[id]` citation with a
+nearby quoted span, does the quote substring-match *that id's chunk
+body specifically*, not just any retrieved chunk?
+
+The failure mode this catches that quote validity misses:
+
+```
+Bad answer: "B5) chunk B5 text" [A6]
+            ^^^^^^^^^^^^^^^^^^^   ^^^
+            quoted from B5     but cited as A6
+```
+
+Quote validity says 1.0 (the quote exists in retrieved chunks — it's
+literally B5). Citation-quote alignment says 0.0 (the quote backs A6,
+which it isn't).
+
+**Why it matters.** Under Option A (claim-level citations) the
+verbatim-quote-plus-justification pattern is the entire audit trail.
+Quote validity proves the quote exists; alignment proves it backs the
+claim. Without alignment, a model could cherry-pick a real quote from
+a tangential chunk and bolt on the wrong citation — the answer would
+read "verbatim and cited", but the citation lies. The two together
+form a strict-but-still-free check that's stronger than either alone.
+
+**Tradeoffs.**
+
+- **Still a proxy, not real entailment.** A quote can back the citation
+  without the *surrounding paraphrase* being faithful. A real
+  faithfulness check would compare paraphrase against chunk via NLI.
+  Deferred until baseline metrics are stable.
+- **Heuristic for "associated quote"** is "in the same paragraph as
+  the citation". Works well in practice but fails if the model
+  separates them. Fixable by tightening the prompt, not the metric.
+- **Denominator matters.** The project counts only quote-backed
+  citations in the alignment fraction; citations without a nearby
+  quote are excluded rather than counted as misaligned. Otherwise
+  PARTIAL answers that legitimately list pointer-citations without
+  per-id quotes get crushed. Confabulation + quote_validity already
+  catch the cases this exclusion would otherwise hide.
+- **All three of {quote_validity, alignment, confabulation} need to
+  be read together.** They overlap deliberately. Confabulation = "id
+  exists in retrieved text". Quote validity = "quoted span exists in
+  some retrieved chunk". Alignment = "quoted span exists in the
+  cited chunk specifically". Each rules out a different failure mode.
+
+**Connection to your day job.** Same shape as the difference between
+"the foreign key value exists in the parent table" (quote validity)
+and "the foreign key value matches the parent row this child claims
+to belong to" (alignment). The first is a referential integrity check;
+the second is a semantic correctness check.
+
+**Further reading.**
+
+- Es et al. 2023, *RAGAS: Automated Evaluation of Retrieval Augmented
+  Generation* — the canonical reference for faithfulness/answer
+  relevance/context relevance as RAG-eval metrics, all LLM-as-judge.
+- The TruLens docs cover the same ground with their "groundedness"
+  metric.
+- Honovich et al. 2022, *TRUE: Re-evaluating Factual Consistency
+  Evaluation* — broader survey of factual-consistency metrics
+  including NLI-based ones, useful when deciding whether to upgrade
+  the proxy to a real model.

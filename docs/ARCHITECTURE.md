@@ -473,13 +473,33 @@ in milliseconds.
 - **Phase 3 — Score.** Pure function over the cached artifacts.
   Output: `metrics.json` + `summary.txt`.
 
-### Metrics (v1)
+### Metrics (v2)
 
-Six metrics, all computed in phase 3:
+Phase 3 computes per-question metrics across three families:
+retrieval quality, answer quality, and confidence calibration.
+Aggregated to run-level means + a strict "correct" rollup.
+
+**Retrieval.**
 
 - **Recall@k** — fraction of expected ids whose parent chunk is in
   the retrieved set. Sub-rule expected ids are collapsed to parent
   chunks for this check (the retriever returns chunks, not sub-rules).
+- **Recall@N curve (N = 1, 3, 5, k)** — same metric, sliced at
+  multiple ranks. Re-uses the already-retrieved hits; computing the
+  curve costs nothing. Phase 1 retrieves `eval_k` chunks per question
+  (default 10) so the curve can extend beyond the generator's `k`
+  without changing generation cost. Plotted as one line for "all"
+  and per-mode lines for ANSWER and PARTIAL. REFUSE excluded
+  (recall is 1.0 by convention).
+- **MRR** — mean reciprocal rank of the first expected hit. Captures
+  ordering quality within top-k that plain recall ignores.
+- **Retrieval score signals** — top-1 cosine, top1-top2 margin, top-k
+  mean. Cheap retrieval-derived confidence indicators; also useful
+  diagnostics for "is the question out-of-domain?" (low top-1 score
+  + high self-confidence is the dangerous pattern).
+
+**Answer quality.**
+
 - **Citation accuracy** — fraction of expected ids cited in the
   answer. Claim-level under Option A; no sub-rule collapsing.
 - **Citation precision** — fraction of cited ids that were expected.
@@ -489,21 +509,73 @@ Six metrics, all computed in phase 3:
   substring-match a retrieved chunk after whitespace normalization.
   This is the programmatic replacement for eyeball-checking the
   verbatim-quote requirement.
+- **Citation-quote alignment (faithfulness proxy)** — stricter than
+  quote validity: for each cited id that has a quote in the same
+  paragraph, does that quote substring-match THAT id's chunk body
+  specifically (not just any retrieved chunk)? Catches the failure
+  "quote from chunk A, cite chunk B" that quote_validity misses.
+  Honest naming: this is a programmatic proxy, not real NLI
+  faithfulness. Only quote-backed citations enter the denominator
+  to avoid penalizing PARTIAL pointer-citations that legitimately
+  lack per-id quotes.
 - **Mode accuracy + confusion matrix** — declared mode vs expected
   mode (ANSWER / PARTIAL / REFUSE). Confusion matrix shows where
-  collapses happen (e.g. ANSWER → PARTIAL).
+  collapses happen (e.g. ANSWER -> PARTIAL). Asymmetric error costs
+  (REFUSE -> ANSWER far worse than ANSWER -> REFUSE) are visible by
+  eye on the heatmap; no explicit weighting in the metric.
 - **Confabulation count** — cited ids whose text is not present in
   any retrieved chunk. Hard failure regardless of other metrics.
+
+**Confidence & calibration.**
+
+- **Self-reported confidence** — model emits a final
+  `Confidence: 0.XX` line per response. Parsed by the harness; `None`
+  if the line is missing or malformed (drift detection — visible in
+  the summary as `n_missing_confidence`).
+- **Confidence threshold summary** — at thresholds {0.9, 0.8, 0.7},
+  how many questions are above/below, and what's the empirical
+  accuracy in each bucket? Drives the "skip review above T"
+  decision. "Correct" defined strictly: `mode_match AND
+  citation_accuracy == 1.0 AND no_confabulation`.
+- **Strict correct count** — same definition as above, run-level
+  aggregate.
+
+### Plots
+
+Six PNGs generated to `<run_dir>/plots/` on every full run AND every
+`--score-only`. Pure functions over `metrics.json`. Plot failures are
+logged but never raise — phase 3 already wrote metrics, plot bugs
+should not lose them.
+
+- **reliability_diagram.png** — confidence-bin -> empirical accuracy,
+  with the diagonal "perfect calibration" reference overlaid. Bars
+  above the diagonal = underconfident; below = overconfident. The
+  plot that directly answers the motivating question ("can I use
+  confidence as a review threshold?").
+- **mode_confusion_matrix.png** — annotated heatmap.
+- **recall_at_k_curve.png** — recall@1/3/5/k, overall and per-mode.
+- **per_question_scorecard.png** — heatmap of questions x metrics,
+  red->green by score. Spots which questions drag aggregates down.
+- **retrieval_score_distribution.png** — top-1 cosine histogram split
+  by expected mode. Validates the hypothesis that REFUSE cases
+  should have low top-1.
+- **confidence_vs_correctness.png** — scatter, point size = top-1
+  retrieval score. Useful when n is small (<= 30) and binned
+  reliability diagrams are noisy.
+
+Stack: seaborn (`whitegrid` theme) on matplotlib. No pandas
+dependency — data passed as `dict[str, list]`.
 
 ### Run artifacts
 
 ```
 evals/results/run-<TIMESTAMP>/
-    config.json     # golden_set hash, prompt hash, model, k, rpm, timestamp
-    hits.json       # phase 1 output
+    config.json     # golden_set hash, prompt hash, model, k, eval_k, rpm, timestamp
+    hits.json       # phase 1 output (eval_k chunks per question; generator sees top-k)
     answers.json    # phase 2 output
     metrics.json    # phase 3 output (per-question scores + aggregate)
     summary.txt     # human-readable aggregate, written every run
+    plots/          # six PNGs, regenerated by --score-only
 ```
 
 `config.json` records `golden_set_hash` (sha256 of sorted YAML),
@@ -514,20 +586,42 @@ comparing tuning experiments, not the same system.
 ### CLI
 
 ```
-python -m wca_rag.eval                       # full run; writes summary.txt
+python -m wca_rag.eval                       # full run; writes summary.txt + plots/
 python -m wca_rag.eval --questions q01,q02   # subset
 python -m wca_rag.eval --rpm 10              # rate limit override
+python -m wca_rag.eval --k 8                 # top-k passed to generator
+python -m wca_rag.eval --eval-k 10           # retrieval depth for recall curve
 python -m wca_rag.eval --summary             # also print aggregate to stdout
 python -m wca_rag.eval --score-only RUN_ID   # rescore cached run; rewrites
-                                             # metrics.json + summary.txt
+                                             # metrics.json + summary.txt + plots/
 ```
 
-`summary.txt` is always written (full run and `--score-only`).
-`--summary` only controls whether the aggregate is also printed to
-stdout. `--score-only` overwrites `metrics.json` and `summary.txt`
-in place — fine while iterating on the scorer; if scorer-versioned
-output becomes useful, add a `--tag` flag to write
-`metrics.<tag>.json` instead.
+`summary.txt` and `plots/` are always (re)written, full run and
+`--score-only`. `--summary` only controls whether the aggregate is
+also printed to stdout. `--score-only` overwrites in place — fine
+while iterating on the scorer; if scorer-versioned output becomes
+useful, add a `--tag` flag to write `metrics.<tag>.json` instead.
+
+`--eval-k` decouples retrieval depth from the generator's `k`. Phase
+1 retrieves `eval_k` chunks per question; phase 2 still feeds only
+the top `k` to the generator (cost unchanged). The extra chunks
+power the recall@N curve without re-running retrieval.
+
+### Prompt-contract implication
+
+The harness reads two model-emitted contracts: the `[MODE]` label at
+the start of the response and the `Confidence: 0.XX` line at the end.
+Both are parsed strictly:
+
+- Missing/malformed `[MODE]` -> declared mode is `None`, shows up as
+  `MISSING` in the confusion matrix.
+- Missing/malformed `Confidence:` line -> `self_confidence` is `None`;
+  question excluded from threshold buckets and reported as
+  `n_missing_confidence` in the summary.
+
+Both being visible in the summary is intentional — silent fallbacks
+would hide prompt drift, exactly the failure mode the strict parser
+exists to detect.
 
 ### Golden set
 
@@ -546,8 +640,19 @@ incident questions.
 
 ### Deferred
 
-- **LLM-as-judge scoring** (faithfulness, answer relevance). Defer
-  until baseline metrics are stable.
+- **LLM-as-judge scoring** for real faithfulness and answer relevance.
+  The current quote-alignment metric is a free programmatic proxy; an
+  actual NLI-style judgment over (retrieved_chunks, answer) pairs is
+  the upgrade path when proxy ceiling effects start to mislead.
+- **Self-consistency confidence** — generate N=3-5 samples at temp>0,
+  measure agreement on cited ids / mode. Stronger signal than
+  self-reported confidence; deferred because of generator quota cost
+  (3-5x phase 2).
+- **Repeat / variance measurement** — re-run phase 2 N times, report
+  metric mean +/- std. Quantifies the run-to-run noise floor at
+  temperature 0.1 (see open issue 2 in SESSION_HANDOFF.md). Worth it
+  when a prompt change shows a sub-0.05 delta and you need to decide
+  signal vs noise.
 - **Token-bucket rate limiting with retry.** Sleep-between-calls is
   fine for ~30-question runs. Revisit at 100+.
 - **Per-question retry on transient errors.** Fail loudly; silent

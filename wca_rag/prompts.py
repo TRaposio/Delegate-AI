@@ -149,6 +149,27 @@ The retrieved regulations do not address this question. They cover \
 [brief description of what they do cover], but say nothing about \
 [the specific topic asked]. Please consult the WCA Regulations directly \
 or escalate to a more senior delegate.\
+
+After your answer, on its own final line, output exactly:
+ 
+Confidence: 0.XX
+ 
+where 0.XX is your confidence (0.00 to 1.00) that your answer correctly
+applies the regulations to the question. Use this scale:
+ 
+  0.95+      the retrieved regulations directly and unambiguously cover
+             the question; you are quoting verbatim from chunks that
+             obviously apply.
+  0.80-0.95  strong match; minor interpretive judgment.
+  0.50-0.80  the retrieved chunks are relevant but require non-trivial
+             interpretation, OR the question is partially out-of-scope.
+  below 0.50 you are uncertain whether the retrieved chunks actually
+             answer what was asked, or the question seems out-of-domain.
+ 
+For [REFUSE] responses, report confidence in the refusal itself (high =
+you are confident no retrieved regulation applies).
+ 
+Do not include the Confidence line anywhere except the final line.
 """
 
 
