@@ -39,6 +39,7 @@ cp .env.example .env
 #   HF_TOKEN        — token from https://huggingface.co/ (for the embedder)
 
 # 4. Build the index (parses the corpus and computes embeddings)
+python -m wca_rag.parser
 python -m wca_rag.index
 
 # 5. Ask a question

@@ -86,13 +86,17 @@ verbatim text in retrieved chunks (sub-regulation ids permitted, e.g.
 
 RUN ARTIFACT LAYOUT
 -------------------
-One directory per run. Three (small) JSON files plus a config blob.
+One directory per run. Three (small) JSON files plus a config blob,
+plus human-readable summaries written every scoring pass.
 
     evals/results/run-<TIMESTAMP>/
         config.json    # what was run: golden_set hash, k, model, prompt hash
         hits.json      # phase 1 output
         answers.json   # phase 2 output
         metrics.json   # phase 3 output (rerun --score-only updates this)
+        summary.txt    # aggregate metrics, human-readable
+        review.md      # flat per-question Q/A for eyeballing
+        plots/         # six PNGs (rerun --score-only regenerates these)
 
 CONFIG HASHES
 -------------
@@ -113,7 +117,7 @@ CLI
     python -m wca_rag.eval --k 8                 # generator top-k (default PIPELINE_DEFAULT_K)
     python -m wca_rag.eval --eval-k 10           # retrieval depth for recall curve (default 10)
     python -m wca_rag.eval --summary             # also print aggregate to stdout
-    python -m wca_rag.eval --score-only RUN_ID   # re-score existing run; rewrites metrics.json + summary.txt + plots/
+    python -m wca_rag.eval --score-only RUN_ID   # re-score existing run; rewrites metrics.json + summary.txt + review.md + plots/
 
 GOLDEN SET FORMAT
 -----------------
@@ -1060,6 +1064,102 @@ def write_summary(run_dir: Path, metrics: dict[str, Any]) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Per-run review report (human eyeball pass)
+# ----------------------------------------------------------------------------
+#
+# review.md is a flat Q/A render of one run, sorted by question id. It
+# joins the golden set (question + notes), the cached answers, and the
+# strict-correct flag from phase 3 into one scrollable file. Purpose:
+# eyeballing individual answers without jq. Aggregate stats stay in
+# summary.txt / metrics.json; this is the per-question view.
+#
+# Written on every full run and every --score-only rerun, same as
+# summary.txt and plots/.
+
+
+def format_review(
+    questions: list[GoldenQuestion],
+    answers: dict[str, AnswerRecord],
+    metrics: dict[str, Any],
+) -> str:
+    """Render a flat Q/A review of one run, sorted by question id.
+
+    Per-question dicts come from metrics["per_question"] which is
+    already asdict()-ed by phase_score; no rescoring needed.
+
+    `correct` mirrors QuestionScore.correct exactly: mode_match AND
+    citation_accuracy==1.0 AND no confabulated_ids. A check mark does
+    NOT mean the answer is well-written or substantively right - only
+    that the harness's strict checks passed. Read the answer text.
+    """
+    per_q_by_id = {pq["question_id"]: pq for pq in metrics["per_question"]}
+
+    lines: list[str] = []
+    lines.append("# Run review")
+    lines.append("")
+    lines.append(
+        "One entry per question, in golden-set order. "
+        "`correct` = strict-correct flag from QuestionScore "
+        "(mode match + citation_accuracy==1.0 + no confabulation). "
+        "Always read the answer text before trusting the flag."
+    )
+    lines.append("")
+
+    for q in questions:
+        score = per_q_by_id.get(q.id)
+        answer = answers.get(q.id)
+
+        if score is None or answer is None:
+            # Question is in the golden set but not in this run
+            # (e.g. --questions subset, or partial-failure run).
+            lines.append(f"## {q.id}  *(not in this run)*")
+            lines.append("")
+            continue
+
+        mark = "✓" if score["correct"] else "✗"
+        declared = score["declared_mode"] or "MISSING"
+        expected = score["expected_mode"]
+        mode_field = (
+            expected if declared == expected else f"{declared}  (expected {expected})"
+        )
+
+        lines.append(f"## {q.id}  {mark}  [{mode_field}]")
+        lines.append("")
+        lines.append("**Question**")
+        lines.append("")
+        lines.append(q.question)
+        lines.append("")
+        lines.append("**Answer**")
+        lines.append("")
+        # Render as a blockquote so multi-paragraph answers stay
+        # visually distinct from the question and the notes.
+        answer_lines = answer.answer_text.splitlines() or [""]
+        for line in answer_lines:
+            lines.append(f"> {line}" if line else ">")
+        lines.append("")
+        lines.append("**Golden-set note**")
+        lines.append("")
+        lines.append(q.notes.strip() if q.notes else "_(none)_")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def write_review(
+    run_dir: Path,
+    questions: list[GoldenQuestion],
+    answers: dict[str, AnswerRecord],
+    metrics: dict[str, Any],
+) -> None:
+    """Write review.md. Idempotent; overwrites on every call."""
+    (run_dir / "review.md").write_text(
+        format_review(questions, answers, metrics), encoding="utf-8"
+    )
+
+
+# ----------------------------------------------------------------------------
 # Plots
 # ----------------------------------------------------------------------------
 #
@@ -1506,6 +1606,7 @@ def main(argv: list[str] | None = None) -> int:
         metrics = phase_score(questions, hits, answers, k=run_k)
         write_json(run_dir / "metrics.json", metrics)
         write_summary(run_dir, metrics)
+        write_review(run_dir, questions, answers, metrics)
         write_plots(run_dir, metrics)
         print(f"rescored: {run_dir}")
         if args.summary:
@@ -1543,6 +1644,7 @@ def main(argv: list[str] | None = None) -> int:
     })
 
     write_summary(run_dir, metrics)
+    write_review(run_dir, questions, answers, metrics)
     write_plots(run_dir, metrics)
 
     print(f"done: {run_dir}")
