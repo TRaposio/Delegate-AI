@@ -1,9 +1,10 @@
 # Architecture
 
-Status legend: 🟢 decided · 🟡 proposed (awaiting feedback) · 🔴 deferred (future)
+Status legend: 🟢 decided · 🟡 proposed (awaiting feedback)
 
-This doc is the source of truth for architectural decisions. Update when
-decisions move between statuses.
+This doc is the source of truth for architectural decisions that are
+already made or in progress. Forward-looking plans live in
+`ROADMAP.md`.
 
 ---
 
@@ -21,7 +22,7 @@ Non-goals for v1:
 - Production deployment, hosting, multi-user.
 - Multi-language support (English only).
 - Fine-tuning models.
-- Sources beyond the WCA Regulations (handbook, rulings — deferred).
+- Sources beyond the WCA Regulations (handbook, rulings).
 
 ---
 
@@ -34,10 +35,8 @@ that several architectures are viable:
 |---|---|---|---|
 | **Long-context stuffing** (whole corpus in every prompt) | No retrieval errors. Model sees everything. | "Lost in the middle" attention degradation. Higher per-query cost. | Possible fallback / baseline. |
 | **Classic RAG** (chunk → embed → top-k → LLM) | Cheap. Fast. Scales to more corpora later. Standard. | Retrieval miss = wrong answer. | 🟢 chosen for v1. |
-| **Hybrid (BM25 + vector + rerank)** | Higher retrieval quality, especially for keyword-heavy queries (e.g. "Article 11i"). | More moving parts. | 🔴 v2. |
-| **Agentic / iterative retrieval** | Handles multi-hop ("rule X cites rule Y...") | Slow, multiple LLM calls. | 🔴 v2/v3. |
 
-**Decision (🟢):** classic RAG for v1, designed so hybrid is a natural extension.
+**Decision (🟢):** classic RAG for v1.
 
 References for further reading:
 - Lewis et al. 2020, *Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks* — original RAG paper.
@@ -102,9 +101,10 @@ Alternatives considered:
 - **pgvector** — Postgres extension. User knows Postgres so this would be familiar, but adds setup overhead.
 
 **Rationale for Chroma:** Python-native, no server, persists to disk, has a
-sane Python API. For learning purposes, the vector-similarity math is so
-simple at this corpus size that we can also write a from-scratch numpy version
-as a learning exercise alongside Chroma — to be discussed.
+sane Python API. Current implementation is NumPy in-memory — at 108 chunks
+the math is so simple that brute force is the fastest and most pedagogical
+option. Chroma becomes worth it when metadata filtering or larger corpora
+demand it.
 
 ### 3.3 Generation LLM 🟢
 
@@ -205,7 +205,7 @@ Used for:
 - **Citation** in answers (`regulation_id`).
 - **Filtering** (`where article == "11"` for incident-only queries).
 - **Debugging** retrieval (human-readable chunk inspection via `full_path_id`).
-- **Future link-aware retrieval** via `cross_references`. The
+- **Cross-reference-aware retrieval** via `cross_references`. The
   `type` distinguishes regulation references (one chunk) from article
   references (many chunks); these expand differently.
 - **Change detection on re-parse** via `text_hash` — diff two `chunks.jsonl`
@@ -223,7 +223,14 @@ that builds the LLM context reads `text` plus uses `regulation_id` for the
 citation marker. This split exists because a chunk like `e2)` is meaningless
 to an embedding model in isolation — the prepended header gives the
 embedding model the article context it needs to place the chunk in semantic
-space. This is the metadata-prepend pattern flagged in `OPEN_QUESTIONS.md §5`.
+space. See `CONCEPTS.md` → "Metadata-prepend" for the underlying pattern.
+
+**Cross-reference graph data** (useful when revisiting link-aware retrieval):
+- 55 / 108 chunks contain at least one cross-reference (~51%).
+- 159 total edges, 124 unique targets — sparse graph with a few hubs.
+- Top referenced targets: `2k` (disqualification), `9u` (end of competition),
+  `3l` (logos), `10f` (misalignment limits), `Article I`, `Article A`, `11i1`
+  (incorrect scrambles).
 
 ### 3.6 Interface 🟢
 
@@ -234,28 +241,7 @@ for inspection.
 - `python -m wca_rag.query "your question"` — retrieve + generate.
 - `python -m wca_rag.eval` — run golden set and report metrics.
 
-Streamlit UI deferred. CLI first.
-
-### 3.7 Cross-reference handling 🔴
-
-Deferred. Many regulations reference others. v1 ignores this. Measure impact
-via golden set, then decide.
-
-**Data from parser run** (useful starting point when this is revisited):
-- 55 / 108 chunks contain at least one cross-reference (~51%).
-- 159 total edges, 124 unique targets — sparse graph with a few hubs.
-- Top referenced targets: `2k` (disqualification), `9u` (end of competition),
-  `3l` (logos), `10f` (misalignment limits), `Article I`, `Article A`, `11i1`
-  (incorrect scrambles).
-- These hubs are good candidates for "always retrieve alongside" link-aware
-  retrieval, when we get to v2.
-- Note that `cross_references` distinguishes `regulation` and `article`
-  types; article expansion (e.g. "include all of Article 11") behaves very
-  differently from regulation expansion (one chunk).
-
----
-
-### 3.8 Retriever 🟢
+### 3.7 Retriever 🟢
 
 **Implemented.** `wca_rag/retriever.py` exposes a `Retriever` class with
 a `from_disk()` classmethod and a `retrieve(query, k=5)` method. CLI
@@ -293,23 +279,12 @@ retrievals at query time.
 
 **Output: `RetrievalHit` dataclass.** Each hit carries `rank`, `score`
 (cosine in [-1, 1]), `regulation_id`, and the full `chunk` dict. The
-generator stage will read `chunk["text"]` for the LLM prompt and
+generator stage reads `chunk["text"]` for the LLM prompt and
 `regulation_id` for the citation marker — note: `text`, not
 `text_for_embedding` (the prepended header is for the embedder only,
 not for human display or LLM context). See §3.5.
 
-**Deferred to retriever v2:**
-- Metadata filtering (will arrive with ChromaDB).
-- Score thresholding (drop hits below similarity X). Currently every
-  retrieval returns exactly k hits; some may be irrelevant when the
-  query is out-of-domain. Worth measuring on the golden set before
-  adding complexity.
-- Cross-reference expansion (see §3.7).
-- Reranking (see §7.1, hybrid retrieval upgrade).
-
----
-
-### 3.9 Generator pipeline 🟢
+### 3.8 Generator pipeline 🟢
 
 **Implemented.** Three modules + one CLI entry point:
 
@@ -355,7 +330,7 @@ risk is negligible (~6k tokens of context). `Pipeline.ask()` accepts a
    include `+` suffixes so the model produces them correctly.
 
 **Prompt assembly format.** Each retrieved chunk wrapped in:
- 
+
 ```
 <regulation id="11e" article="11">
 {chunk["text"]}
@@ -365,22 +340,11 @@ XML-ish wrapper chosen over plain `[Regulation 11e]` headers for two
 reasons: clearer chunk boundaries (LLMs respect XML-shaped tags well),
 and the citation instruction becomes literal — "cite using the `id`
 attribute". Uses `chunk["text"]`, NOT `chunk["text_for_embedding"]`.
- 
+
 **Generator interface: batch only in v1.** Streaming would complicate
 citation parsing (you can't validate citations until the answer is
 fully generated) and the CLI does not benefit. The ABC can grow a
 `stream()` method later without breaking `generate()`.
- 
-**Deferred to v2:**
-- Streaming output (will arrive with the UI).
-- Structured-output mode (JSON answer + structured citations field).
-  Useful when a UI can render it; noise for a CLI.
-- Prompt caching for the system prompt + retrieved chunks. Free-tier
-  Gemini doesn't benefit; revisit when on a paid API.
-- Two-pass refusal verification (a second LLM call that grades the
-  first one's output). Worth measuring on the golden set first.
-- Output-format validation (does the answer actually contain quoted
-  text + bracketed citations?). Currently trusted to the system prompt.
 
 **Citation granularity: Option A (claim-level) 🟢.** The model cites
 the most specific id whose verbatim text appears in a retrieved
@@ -423,9 +387,6 @@ data/raw/wca-regulations.md
 [embedder] ──► (data/embeddings.npy,                         ✅
                 data/chunk_ids.json,
                 data/embeddings.meta.json)
-        │
-        ▼
-[chroma]   ──► persisted vector DB (data/chroma/)            ⬜ later
 ```
 
 ### Query (online)
@@ -437,7 +398,7 @@ user question
 [embedder.encode_query]  ──► query vector                    ✅
         │
         ▼
-[retriever]              ──► top-k hits + metadata           ✅ (NumPy; Chroma later)
+[retriever]              ──► top-k hits + metadata           ✅
         │
         ▼
 [prompt assembler]       ──► system prompt + chunks + question  ✅
@@ -635,32 +596,6 @@ exists to detect.
   notes: "..."                  # human-readable rationale
 ```
 
-Currently 3 fixtures (v0). Target for v1 is 15-30 hand-written
-incident questions.
-
-### Deferred
-
-- **LLM-as-judge scoring** for real faithfulness and answer relevance.
-  The current quote-alignment metric is a free programmatic proxy; an
-  actual NLI-style judgment over (retrieved_chunks, answer) pairs is
-  the upgrade path when proxy ceiling effects start to mislead.
-- **Self-consistency confidence** — generate N=3-5 samples at temp>0,
-  measure agreement on cited ids / mode. Stronger signal than
-  self-reported confidence; deferred because of generator quota cost
-  (3-5x phase 2).
-- **Repeat / variance measurement** — re-run phase 2 N times, report
-  metric mean +/- std. Quantifies the run-to-run noise floor at
-  temperature 0.1 (see open issue 2 in SESSION_HANDOFF.md). Worth it
-  when a prompt change shows a sub-0.05 delta and you need to decide
-  signal vs noise.
-- **Token-bucket rate limiting with retry.** Sleep-between-calls is
-  fine for ~30-question runs. Revisit at 100+.
-- **Per-question retry on transient errors.** Fail loudly; silent
-  retries hide systematic problems.
-- **Run-diff tooling.** Useful later. Eyeball + `jq` + `summary.txt`
-  is fine for now.
-- **RAGAS / TruLens / DeepEval framework integration.**
-
 ---
 
 ## 6. Repo layout 🟢
@@ -670,8 +605,7 @@ wca-rag/
 ├── CLAUDE.md               # at repo root
 ├── docs/
 │   ├── ARCHITECTURE.md
-│   ├── OPEN_QUESTIONS.md
-│   ├── SESSION_HANDOFF.md  # cross-session state
+│   ├── ROADMAP.md          # forward-looking plan; source of truth for "what's next"
 │   └── CONCEPTS.md         # learning notes — RAG concepts as we hit them
 ├── README.md
 ├── pyproject.toml          # or environment.yml for conda
@@ -708,18 +642,3 @@ wca-rag/
 
 Light footprint. No `tests/` directory yet — add when the codebase
 justifies it.
-
----
-
-## 7. Future enhancements (🔴 deferred)
-
-In rough priority order:
-
-1. **Hybrid retrieval (BM25 + vector + reranker).** Likely the single biggest quality win.
-2. **Cross-reference / link-aware retrieval.** Follow regulation references in retrieved chunks.
-3. **Multilingual interface.** Translate question → English → answer → translate back.
-4. **Additional sources.** Delegate Handbook, past WRC rulings.
-5. **Streamlit UI.**
-6. **LLM-as-judge automated evaluation** (RAGAS or similar).
-7. **Prompt caching** for the system prompt + retrieved chunks (cost optimization once on a paid API).
-8. **Re-indexing automation** when WCA publishes a new regulations version.
