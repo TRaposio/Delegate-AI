@@ -15,3 +15,4 @@ dependencies:
   - pip:
       - python-dotenv
       - google-genai
+      - groq

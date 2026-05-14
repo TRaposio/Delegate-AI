@@ -164,7 +164,7 @@ import numpy as np
 import seaborn as sns
 import yaml
 
-from wca_rag.generator import GeminiGenerator
+from wca_rag.generator import GeminiGenerator, GroqGenerator, Generator
 from wca_rag.pipeline import PIPELINE_DEFAULT_K
 from wca_rag.prompts import SYSTEM_PROMPT, assemble_user_prompt
 from wca_rag.retriever import RetrievalHit, Retriever
@@ -218,6 +218,12 @@ CONFIDENCE_PATTERN = re.compile(
 # citation regex hits (mode labels would otherwise match) and to
 # validate golden-set entries.
 MODES = {"ANSWER", "PARTIAL", "REFUSE"}
+
+GENERATORS: dict[str, type[Generator]] = {
+    "gemini": GeminiGenerator,
+    "groq": GroqGenerator,
+}
+DEFAULT_GENERATOR = "gemini"
 
 
 # ----------------------------------------------------------------------------
@@ -391,7 +397,7 @@ def phase_retrieve(
 def phase_generate(
     questions: list[GoldenQuestion],
     hits_by_question: dict[str, list[HitRecord]],
-    generator: GeminiGenerator,
+    generator: Generator,
     rpm: int,
     k: int,
 ) -> dict[str, AnswerRecord]:
@@ -1533,6 +1539,16 @@ def main(argv: list[str] | None = None) -> int:
         help=f"max requests per minute (default {DEFAULT_RPM})",
     )
     parser.add_argument(
+        "--generator",
+        choices=sorted(GENERATORS),
+        default=DEFAULT_GENERATOR,
+        help=(
+            f"LLM provider (default {DEFAULT_GENERATOR}). "
+            "Tier 3 baseline runs should stay on gemini; "
+            "use groq for exploratory work (ROADMAP §A2)."
+        ),
+    )
+    parser.add_argument(
         "--k",
         type=int,
         default=PIPELINE_DEFAULT_K,
@@ -1624,7 +1640,7 @@ def main(argv: list[str] | None = None) -> int:
     write_json(run_dir / "hits.json", {qid: [asdict(h) for h in hl] for qid, hl in hits.items()})
 
     print(f"phase 2: generate  (rpm={args.rpm})")
-    generator = GeminiGenerator()
+    generator = GENERATORS[args.generator]()
     answers = phase_generate(questions, hits, generator, rpm=args.rpm, k=args.k)
     write_json(run_dir / "answers.json", {qid: asdict(a) for qid, a in answers.items()})
 
@@ -1636,6 +1652,7 @@ def main(argv: list[str] | None = None) -> int:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "golden_set_hash": hash_golden_set(questions),
         "prompt_hash": hash_text(SYSTEM_PROMPT),
+        "provider": args.generator,
         "model_name": generator.model_name,
         "k": args.k,
         "eval_k": args.eval_k,

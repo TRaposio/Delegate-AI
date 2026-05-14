@@ -20,9 +20,16 @@ import sys
 
 from wca_rag._format import format_hit
 from wca_rag.embedder import SentenceTransformerEmbedder
-from wca_rag.generator import GeminiGenerator
+from wca_rag.generator import GeminiGenerator, GroqGenerator, Generator
 from wca_rag.pipeline import PIPELINE_DEFAULT_K, Pipeline
 from wca_rag.retriever import Retriever
+
+
+GENERATORS: dict[str, type[Generator]] = {
+    "gemini": GeminiGenerator,
+    "groq": GroqGenerator,
+}
+DEFAULT_GENERATOR = "gemini"
 
 
 def main() -> int:
@@ -36,6 +43,16 @@ def main() -> int:
         type=int,
         default=PIPELINE_DEFAULT_K,
         help=f"Number of chunks to retrieve (default: {PIPELINE_DEFAULT_K}).",
+    )
+    parser.add_argument(
+        "--generator",
+        choices=sorted(GENERATORS),
+        default=DEFAULT_GENERATOR,
+        help=(
+            f"LLM provider (default {DEFAULT_GENERATOR}). "
+            "Tier 3 baseline runs should stay on gemini; "
+            "use groq for exploratory work (ROADMAP §A2)."
+        ),
     )
     parser.add_argument(
         "--show-hits",
@@ -54,7 +71,7 @@ def main() -> int:
 
     embedder = SentenceTransformerEmbedder()
     retriever = Retriever.from_disk(embedder=embedder)
-    generator = GeminiGenerator()
+    generator = GENERATORS[args.generator]()
     pipeline = Pipeline(retriever=retriever, generator=generator)
 
     try:

@@ -1,20 +1,22 @@
 """
 Generator: takes a system prompt + user prompt, returns the LLM's answer.
 
-Mirrors the embedder pattern: an ABC defines the contract, a concrete
-implementation wraps the chosen provider. Default implementation uses
+Mirrors the embedder pattern: an ABC defines the contract, concrete
+implementations wrap the chosen provider. Default implementation uses
 Google Gemini (gemini-2.5-flash, free tier — ARCHITECTURE.md §3.3).
+GroqGenerator (Llama 3.3 70B) added per ROADMAP.md §A2 to free
+exploratory work from the Gemini RPD bottleneck.
 
 v1 is batch-only (single call, full response). Streaming would
 complicate citation validation downstream and the CLI does not benefit;
 the ABC can grow a `stream()` method later without breaking `generate()`.
 
-API key handling: GEMINI_API_KEY is read from the environment.
-python-dotenv loads it from .env if present. See README → Setup.
+API key handling: GEMINI_API_KEY / GROQ_API_KEY read from environment.
+python-dotenv loads them from .env if present. See README → Setup.
 
-SDK note: uses `google-genai` (the unified SDK as of 2025), NOT the
-deprecated `google-generativeai`. The two packages have similar names
-and very different APIs; do not mix them.
+SDK note (Gemini): uses `google-genai` (the unified SDK as of 2025),
+NOT the deprecated `google-generativeai`. The two packages have similar
+names and very different APIs; do not mix them.
 """
 
 from __future__ import annotations
@@ -148,6 +150,102 @@ class GeminiGenerator(Generator):
 
         return GenerationResult(
             text=response.text,
+            model=self._model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+
+# ----------------------------------------------------------------------------
+# Groq implementation
+# ----------------------------------------------------------------------------
+
+
+class GroqGenerator(Generator):
+    """Groq implementation. Wraps the `groq` SDK (OpenAI-compatible API).
+
+    Used for exploratory work that would otherwise burn Gemini's ~20
+    RPD quota (ROADMAP.md §A2). Groq's free tier offers Llama 3.3 70B
+    at ~30 RPM with no daily cap as of writing — verify before
+    relying on it, free-tier terms shift.
+
+    Tier 3 baseline runs should stay on Gemini for reproducibility
+    (ROADMAP.md §A4). This generator is for B-phase Tier 1/2 work and
+    exploratory Tier 3 only.
+
+    Lazy import follows the same pattern as GeminiGenerator.
+
+    Prompt-contract caveat: Llama 3.3 70B may not follow the [MODE] +
+    `Confidence: 0.XX` contract as reliably as Gemini. The eval harness
+    parses both strictly and reports None / MISSING on drift, which is
+    intentional — silent fallbacks would hide the failure. Expect some
+    non-zero MISSING / n_missing_confidence on the first Groq run.
+    """
+
+    DEFAULT_MODEL = "llama-3.3-70b-versatile"
+
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        api_key: str | None = None,
+        temperature: float = 0.1,
+    ) -> None:
+        # Same temperature rationale as Gemini: citation-heavy QA, not
+        # creative writing. 0.1 leaves a sliver of variation for
+        # phrasing without inviting confabulation.
+        self._model = model
+        self._temperature = temperature
+
+        api_key = api_key or os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GROQ_API_KEY not set. Add it to .env (see .env.example) "
+                "or export it in your shell."
+            )
+
+        try:
+            from groq import Groq
+        except ImportError as e:
+            raise ImportError(
+                "groq not installed. Run: pip install groq."
+            ) from e
+
+        self._client = Groq(api_key=api_key)
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    def generate(self, system_prompt: str, user_prompt: str) -> GenerationResult:
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=self._temperature,
+        )
+
+        # OpenAI-compatible response shape: choices[0].message.content.
+        # Guard against empty choices — shouldn't happen on success but
+        # the SDK won't raise on a malformed payload.
+        if not response.choices:
+            raise RuntimeError(
+                f"Groq returned no choices for model {self._model}. "
+                "Check rate limits and model availability."
+            )
+        text = response.choices[0].message.content or ""
+
+        # Groq reports usage in OpenAI's field naming
+        # (prompt_tokens / completion_tokens), not Gemini's.
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        output_tokens = (
+            getattr(usage, "completion_tokens", None) if usage else None
+        )
+
+        return GenerationResult(
+            text=text,
             model=self._model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
